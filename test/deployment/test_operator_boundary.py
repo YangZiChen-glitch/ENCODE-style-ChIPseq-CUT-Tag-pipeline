@@ -196,9 +196,11 @@ def _worker_service_identity() -> ServiceIdentity:
     )
 
 
-def _docker_service_identity() -> ServiceIdentity:
+def _docker_service_identity(
+    unit: str = "helixweave-docker-rootless.service",
+) -> ServiceIdentity:
     return ServiceIdentity.create(
-        unit="helixweave-docker-rootless.service",
+        unit=unit,
         deployment_identity=IDENTITY,
         task_identity=TASK_IDENTITY,
         main_pid=1234,
@@ -211,7 +213,7 @@ def _docker_service_identity() -> ServiceIdentity:
         cgroup_identity=f"sha256-{'1' * 64}",
         sockets=(
             SocketWitness(
-                name="bulk-docker",
+                name="api-http" if unit == "helixweave-api.service" else "bulk-docker",
                 device=41,
                 inode=84,
                 kernel_inode=4567,
@@ -787,11 +789,19 @@ def test_systemctl_observation_fails_closed_until_daemon_reload_completes() -> N
     assert "NeedDaemonReload" in executor.calls[0][0][4]
 
 
+@pytest.mark.parametrize(
+    "unit", ("helixweave-worker.service", "helixweave-api.service")
+)
 def test_service_start_stops_synchronously_when_identity_persistence_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unit: str,
 ) -> None:
-    service = _worker_service_identity()
+    service = (
+        _worker_service_identity()
+        if unit == "helixweave-worker.service"
+        else _docker_service_identity(unit)
+    )
 
     class SequencedProbe:
         def __init__(self) -> None:
@@ -827,7 +837,7 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
         controller.start(
             OperatorRequest(
                 operation="start",
-                unit="helixweave-worker.service",
+                unit=unit,
                 deployment_identity=IDENTITY,
                 task_identity=TASK_IDENTITY,
             )
@@ -835,8 +845,8 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
 
     assert captured.value.issue.code == "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"
     assert systemctl.calls == [
-        ("start", "helixweave-worker.service"),
-        ("stop", "helixweave-worker.service"),
+        ("start", unit),
+        ("stop", unit),
     ]
 
 
@@ -901,9 +911,11 @@ def test_rootless_docker_start_waits_for_full_service_identity(
     assert persisted == [service]
 
 
-def test_rootless_docker_start_readiness_wait_is_bounded(
+@pytest.mark.parametrize("unit", operator_module._READINESS_UNITS)
+def test_socket_service_start_readiness_wait_is_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unit: str,
 ) -> None:
     class PendingProbe:
         starting_calls = 0
@@ -913,7 +925,9 @@ def test_rootless_docker_start_readiness_wait_is_bounded(
 
         def observe_starting(self, **_kwargs):
             self.starting_calls += 1
-            raise operator_module._ServiceReadinessPending
+            raise operator_module._ServiceReadinessPending(
+                (123, 456, IDENTITY, IDENTITY)
+            )
 
     class RecordingSystemctl:
         calls: list[tuple[str, str]] = []
@@ -947,7 +961,7 @@ def test_rootless_docker_start_readiness_wait_is_bounded(
         controller.start(
             OperatorRequest(
                 operation="start",
-                unit="helixweave-docker-rootless.service",
+                unit=unit,
                 deployment_identity=IDENTITY,
                 task_identity=TASK_IDENTITY,
             )
@@ -958,13 +972,15 @@ def test_rootless_docker_start_readiness_wait_is_bounded(
     assert sum(sleeps) == pytest.approx(10.0)
     assert now[0] == pytest.approx(15.0)
     assert all(0 < delay <= 0.1 for delay in sleeps)
-    assert systemctl.calls == [("start", "helixweave-docker-rootless.service")]
+    assert systemctl.calls == [("start", unit)]
     assert persisted == []
 
 
-def test_rootless_docker_start_does_not_retry_hard_identity_failure(
+@pytest.mark.parametrize("unit", operator_module._READINESS_UNITS)
+def test_socket_service_start_does_not_retry_hard_identity_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unit: str,
 ) -> None:
     class HardFailureProbe:
         starting_calls = 0
@@ -1002,7 +1018,7 @@ def test_rootless_docker_start_does_not_retry_hard_identity_failure(
         controller.start(
             OperatorRequest(
                 operation="start",
-                unit="helixweave-docker-rootless.service",
+                unit=unit,
                 deployment_identity=IDENTITY,
                 task_identity=TASK_IDENTITY,
             )
@@ -1562,6 +1578,170 @@ def test_linux_service_probe_binds_filesystem_and_kernel_socket_inodes(
             4567,
         ),
     )
+
+
+def _api_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    probe, _ = _unix_socket_probe(tmp_path)
+    unit = "helixweave-api.service"
+    group = probe.cgroup_root / "system.slice" / unit
+    group.mkdir()
+    (group / "cgroup.procs").write_text("123\n")
+    process = probe.proc_root / "123"
+    (process / "stat").write_bytes(b"123 (python) " + b"0 " * 19 + b"5678\n")
+    (process / "cmdline").write_bytes(b"python\x00-m\x00encode_pipeline\x00api\x00")
+    (process / "exe").symlink_to(Path(sys.executable).resolve())
+    boot = probe.proc_root / "sys/kernel/random/boot_id"
+    boot.parent.mkdir(parents=True)
+    boot.write_text("00112233-4455-6677-8899-aabbccddeeff\n")
+    (probe.proc_root / "net/tcp").write_text("header\n")
+    (probe.proc_root / "net/tcp6").write_text("header\n")
+    values = dict(
+        ActiveState="inactive",
+        SubState="dead",
+        MainPID="0",
+        InvocationID="a" * 32,
+        ControlGroup=f"/system.slice/{unit}",
+        NeedDaemonReload="no",
+    )
+
+    def control(action, name):
+        assert (action, name) == ("start", unit)
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+
+    systemctl = SimpleNamespace(control=control, show=lambda _unit: dict(values))
+    probe.systemctl = systemctl
+    monkeypatch.setattr(
+        probe,
+        "_cgroup_socket_stat",
+        lambda *_args, **_kwargs: SimpleNamespace(st_dev=41, st_ino=4567),
+    )
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        systemctl=systemctl,
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    request = OperatorRequest(
+        operation="start",
+        unit=unit,
+        deployment_identity=IDENTITY,
+        task_identity=TASK_IDENTITY,
+    )
+    return controller, probe, request, values
+
+
+def test_api_start_waits_for_same_invocation_then_persists_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, probe, request, _ = _api_start_probe(tmp_path, monkeypatch)
+    persisted = []
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+
+    def ready(delay):
+        assert delay == 0.1
+        assert persisted == []
+        now[0] += delay
+        (probe.proc_root / "net/tcp").write_text(
+            "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+        )
+
+    monkeypatch.setattr(operator_module.time, "sleep", ready)
+    observed = controller.start(request)
+    assert persisted == [observed]
+    assert now[0] == 0.1
+    assert observed.main_pid == 123
+    assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
+
+
+@pytest.mark.parametrize(
+    "failure", ("exit", "restart", "restart-ready", "late-success")
+)
+def test_api_readiness_does_not_adopt_a_restart_exit_or_late_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+
+    def change(delay):
+        now[0] += delay
+        if failure == "exit":
+            values.update(ActiveState="failed", SubState="dead", MainPID="0")
+        elif failure == "restart":
+            values["InvocationID"] = "b" * 32
+        else:
+            if failure == "restart-ready":
+                values["InvocationID"] = "b" * 32
+            (probe.proc_root / "net/tcp").write_text(
+                "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+            )
+            original = probe._cgroup_socket_stat
+
+            def slow(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if failure == "late-success":
+                    now[0] = 15.0
+                return result
+
+            monkeypatch.setattr(probe, "_cgroup_socket_stat", slow)
+
+    monkeypatch.setattr(operator_module.time, "sleep", change)
+    with pytest.raises(DeploymentError) as captured:
+        controller.start(request)
+    assert captured.value.issue.code == (
+        "OPERATOR_SERVICE_OBSERVE_FAILED"
+        if failure in {"restart", "restart-ready"}
+        else "OPERATOR_SERVICE_START_FAILED"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure", ("wrong-listener", "foreign-owner", "cgroup", "unstable-process")
+)
+def test_api_missing_listener_does_not_mask_hard_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    controller, probe, request, _ = _api_start_probe(tmp_path, monkeypatch)
+    if failure in {"wrong-listener", "foreign-owner"}:
+        endpoint = "00000000" if failure == "wrong-listener" else "0100007F"
+        (probe.proc_root / "net/tcp").write_text(
+            f"header\n0: {endpoint}:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+        )
+        monkeypatch.setattr(probe, "_cgroup_socket_stat", lambda *_a, **_k: None)
+    elif failure == "cgroup":
+        (probe.cgroup_root / "system.slice" / request.unit / "cgroup.procs").write_text(
+            "999\n"
+        )
+    else:
+        original = probe._socket_witnesses
+
+        def change_process(**kwargs):
+            try:
+                return original(**kwargs)
+            finally:
+                (probe.proc_root / "123/cmdline").write_bytes(b"wrong-command\x00")
+
+        monkeypatch.setattr(probe, "_socket_witnesses", change_process)
+    monkeypatch.setattr(
+        operator_module.time, "sleep", lambda _d: pytest.fail("retried")
+    )
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    with pytest.raises(DeploymentError) as captured:
+        controller.start(request)
+    assert captured.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
 
 
 @pytest.mark.parametrize("pending_boundary", ("socket", "listener"))

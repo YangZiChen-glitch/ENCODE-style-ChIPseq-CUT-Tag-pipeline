@@ -153,7 +153,11 @@ SAFE_ENVIRONMENT = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
 }
 _SYSTEMCTL_TIMEOUT_SECONDS = 15.0
-_ROOTLESS_DOCKER_READINESS_POLL_SECONDS = 0.1
+_SERVICE_READINESS_POLL_SECONDS = 0.1
+_READINESS_UNITS = (
+    "helixweave-docker-rootless.service",
+    "helixweave-api.service",
+)
 _BULK_RUNTIME_SYSTEMD_TIMEOUT_SECONDS = 14_700.0
 _MAX_COMMAND_OUTPUT = 64 * 1024
 _MAX_OPERATOR_DOCUMENT_BYTES = 1024 * 1024
@@ -1268,6 +1272,10 @@ class ServiceProbe(Protocol):
 class _ServiceReadinessPending(Exception):
     """A socket-bearing service is running but has not begun listening."""
 
+    def __init__(self, api_process: tuple[int, int, str, str] | None = None) -> None:
+        super().__init__()
+        self.api_process = api_process
+
 
 class LinuxServiceProbe:
     """Bind systemd, procfs, cgroup, executable, command line, and sockets."""
@@ -1336,9 +1344,9 @@ class LinuxServiceProbe:
         deployment_identity: str,
         task_identity: str,
     ) -> ServiceIdentity | None:
-        """Observe rootless Docker while distinguishing only absent readiness."""
+        """Distinguish only absent readiness for the two bounded-start units."""
 
-        if unit != "helixweave-docker-rootless.service":
+        if unit not in _READINESS_UNITS:
             return self.observe(
                 unit=unit,
                 deployment_identity=deployment_identity,
@@ -1413,13 +1421,22 @@ class LinuxServiceProbe:
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
             )
-        sockets = self._socket_witnesses(
-            unit=unit,
-            cgroup=expected_cgroup,
-            main_pid=main_pid,
-            allow_socket_pending=allow_socket_pending,
-        )
         try:
+            sockets = self._socket_witnesses(
+                unit=unit,
+                cgroup=expected_cgroup,
+                main_pid=main_pid,
+                allow_socket_pending=allow_socket_pending,
+            )
+        except _ServiceReadinessPending:
+            if unit != "helixweave-api.service":
+                raise
+            # Absence is not a successful observation. Before classifying it as
+            # pending, still verify cgroup membership and every stability check.
+            sockets = None
+        try:
+            if sockets is None and main_pid not in self._cgroup_pids(expected_cgroup):
+                raise OSError
             final_values = self.systemctl.show(unit)
             final_stat = (process / "stat").read_bytes()
             final_closing = final_stat.rfind(b")")
@@ -1442,6 +1459,15 @@ class LinuxServiceProbe:
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
+            )
+        if sockets is None:
+            raise _ServiceReadinessPending(
+                (
+                    main_pid,
+                    start_ticks,
+                    _bytes_identity(values["InvocationID"].encode()),
+                    _bytes_identity(boot.strip()),
+                )
             )
         return ServiceIdentity.create(
             unit=unit,
@@ -1470,7 +1496,9 @@ class LinuxServiceProbe:
         if not names:
             return ()
         if unit == "helixweave-api.service":
-            observed = self._api_socket(cgroup, main_pid=main_pid)
+            observed = self._api_socket(
+                cgroup, main_pid=main_pid, allow_socket_pending=allow_socket_pending
+            )
             return (
                 SocketWitness(
                     "api-http",
@@ -1521,12 +1549,27 @@ class LinuxServiceProbe:
             ),
         )
 
-    def _api_socket(self, cgroup: str, *, main_pid: int) -> os.stat_result:
+    def _api_socket(
+        self, cgroup: str, *, main_pid: int, allow_socket_pending: bool = False
+    ) -> os.stat_result:
         inodes: set[int] = set()
         try:
             lines = (
                 (self.proc_root / "net/tcp").read_text(encoding="ascii").splitlines()
             )
+            if allow_socket_pending:
+                # A listener on the configured port but a different endpoint is
+                # an identity failure, not permission to wait for another one.
+                ipv6 = (self.proc_root / "net/tcp6").read_text(encoding="ascii")
+                for line in (*lines[1:], *ipv6.splitlines()[1:]):
+                    fields = line.split()
+                    if (
+                        len(fields) >= 4
+                        and fields[1].endswith(":1F40")
+                        and fields[3] == "0A"
+                        and fields[1] != "0100007F:1F40"
+                    ):
+                        raise OSError
         except OSError:
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
@@ -1539,6 +1582,8 @@ class LinuxServiceProbe:
                     inodes.add(int(fields[9]))
                 except ValueError:
                     pass
+        if not inodes and allow_socket_pending:
+            raise _ServiceReadinessPending
         if len(inodes) != 1:
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
@@ -1713,7 +1758,7 @@ class SystemdServiceController:
             )
         readiness_deadline = (
             time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS
-            if request.unit == "helixweave-docker-rootless.service"
+            if request.unit in _READINESS_UNITS
             else None
         )
         self.systemctl.control("start", request.unit)
@@ -1737,7 +1782,7 @@ class SystemdServiceController:
         readiness_deadline: float | None,
     ) -> ServiceIdentity | None:
         assert request.unit is not None
-        if request.unit != "helixweave-docker-rootless.service":
+        if request.unit not in _READINESS_UNITS:
             return self.probe.observe(
                 unit=request.unit,
                 deployment_identity=request.deployment_identity,
@@ -1745,14 +1790,30 @@ class SystemdServiceController:
             )
         observer = getattr(self.probe, "observe_starting", self.probe.observe)
         assert readiness_deadline is not None
+        api_process = None
         while True:
+            if time.monotonic() >= readiness_deadline:
+                raise fail(
+                    "OPERATOR_SERVICE_START_FAILED",
+                    "Service did not enter the running state.",
+                    recoverable=True,
+                )
             try:
-                return observer(
+                service = observer(
                     unit=request.unit,
                     deployment_identity=request.deployment_identity,
                     task_identity=request.task_identity,
                 )
-            except _ServiceReadinessPending:
+            except _ServiceReadinessPending as pending:
+                if request.unit == "helixweave-api.service":
+                    if pending.api_process is None or (
+                        api_process is not None and pending.api_process != api_process
+                    ):
+                        raise fail(
+                            "OPERATOR_SERVICE_OBSERVE_FAILED",
+                            "Service status could not be observed.",
+                        ) from None
+                    api_process = pending.api_process
                 remaining = readiness_deadline - time.monotonic()
                 if remaining <= 0:
                     raise fail(
@@ -1760,7 +1821,32 @@ class SystemdServiceController:
                         "Service did not enter the running state.",
                         recoverable=True,
                     ) from None
-                time.sleep(min(_ROOTLESS_DOCKER_READINESS_POLL_SECONDS, remaining))
+                time.sleep(min(_SERVICE_READINESS_POLL_SECONDS, remaining))
+                continue
+            if (
+                service is not None
+                and api_process is not None
+                and api_process
+                != (
+                    service.main_pid,
+                    service.process_start_ticks,
+                    service.invocation_identity,
+                    service.boot_identity,
+                )
+            ):
+                raise fail(
+                    "OPERATOR_SERVICE_OBSERVE_FAILED",
+                    "Service status could not be observed.",
+                )
+            # Time spent in systemctl and in the strong probe consumes the same
+            # deadline. A late successful observation must not be persisted.
+            if time.monotonic() >= readiness_deadline:
+                raise fail(
+                    "OPERATOR_SERVICE_START_FAILED",
+                    "Service did not enter the running state.",
+                    recoverable=True,
+                )
+            return service
 
     def recover_start(self, request: OperatorRequest) -> ServiceIdentity:
         """Adopt only this journal-bound start, or execute it idempotently."""
