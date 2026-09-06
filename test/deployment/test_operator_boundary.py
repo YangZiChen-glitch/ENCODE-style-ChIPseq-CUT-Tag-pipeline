@@ -795,7 +795,12 @@ def test_systemctl_observation_fails_closed_until_daemon_reload_completes() -> N
 
 
 @pytest.mark.parametrize(
-    "unit", ("helixweave-worker.service", "helixweave-api.service")
+    "unit",
+    (
+        "helixweave-worker.service",
+        "helixweave-api.service",
+        "helixweave-docker-rootless.service",
+    ),
 )
 def test_service_start_stops_synchronously_when_identity_persistence_fails(
     tmp_path: Path,
@@ -823,6 +828,10 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
             self.calls.append((action, unit))
 
     systemctl = RecordingSystemctl()
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
     controller = SystemdServiceController(
         DeploymentLayout.isolated(tmp_path / "host"),
         systemctl=systemctl,
@@ -853,6 +862,13 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
         ("start", unit),
         ("stop", unit),
     ]
+    if unit == "helixweave-docker-rootless.service":
+        diagnostics = [json.loads(line.split(" ", 1)[1]) for line in logs]
+        assert [(d["phase"], d["code"]) for d in diagnostics] == [
+            ("systemctl", "OK"),
+            ("observe", "OK"),
+            ("persist", "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"),
+        ]
 
 
 def test_rootless_docker_start_waits_for_full_service_identity(
@@ -870,7 +886,14 @@ def test_rootless_docker_start_waits_for_full_service_identity(
         def observe_starting(self, **_kwargs):
             self.starting_calls += 1
             if self.starting_calls < 3:
-                raise operator_module._ServiceReadinessPending
+                raise operator_module._ServiceReadinessPending(
+                    (
+                        service.main_pid,
+                        service.process_start_ticks,
+                        service.invocation_identity,
+                        service.boot_identity,
+                    )
+                )
             return service
 
     class RecordingSystemctl:
@@ -1666,6 +1689,165 @@ def test_api_start_waits_for_same_invocation_then_persists_once(
     assert now[0] == 0.1
     assert observed.main_pid == 123
     assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
+
+
+def _docker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+    unit = "helixweave-docker-rootless.service"
+    group = probe.cgroup_root / "system.slice" / unit
+    group.mkdir()
+    (group / "cgroup.procs").write_text("123\n")
+    values["ControlGroup"] = f"/system.slice/{unit}"
+    probe.unix_sockets[unit] = probe.unix_sockets["helixweave-redis.service"]
+
+    def control(action, name):
+        assert (action, name) == ("start", unit)
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+
+    controller.systemctl.control = control
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        operator_module.time, "sleep", lambda d: now.__setitem__(0, now[0] + d)
+    )
+    return controller, probe, replace(request, unit=unit), values, now
+
+
+@pytest.mark.parametrize("boundary", ("fd", "pid-directory"))
+def test_docker_proc_enoent_repeats_full_observation_before_persisting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    controller, probe, request, _, now = _docker_start_probe(tmp_path, monkeypatch)
+    operation = "readlink" if boundary == "fd" else "scandir"
+    original = getattr(os, operation)
+    scans = []
+    logs = []
+    persisted = []
+
+    def vanishing(path, *args, **kwargs):
+        if str(path).startswith(str(probe.proc_root / "123/fd")):
+            scans.append(path)
+            if len(scans) == 1:
+                raise FileNotFoundError(errno.ENOENT, "private path must not be logged")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, operation, vanishing)
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _priority, text: logs.append(text)
+    )
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    service = controller.start(request)
+    assert len(scans) == 2 and now[0] == 0.1
+    assert persisted == [service]
+    assert service.main_pid == 123 and service.process_start_ticks == 5678
+    assert service.sockets == (SocketWitness("bulk-docker", 41, 84, 4567),)
+    diagnostics = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    assert [(d["phase"], d["code"]) for d in diagnostics] == [
+        ("systemctl", "OK"),
+        ("observe", "OK"),
+        ("persist", "OK"),
+    ]
+    assert "private" not in "".join(logs)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "deadline",
+        "permission",
+        "restart",
+        "start-time",
+        "exit",
+        "main-missing",
+        "socket-swap",
+        "other-missing",
+    ),
+)
+def test_docker_proc_scan_failure_is_narrow_and_process_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    controller, probe, request, values, now = _docker_start_probe(tmp_path, monkeypatch)
+    original = os.readlink
+    calls = []
+    logs = []
+
+    def missing(path, *args, **kwargs):
+        if str(path).startswith(str(probe.proc_root / "123/fd")):
+            calls.append(path)
+            if failure == "main-missing":
+                (probe.proc_root / "123/stat").unlink()
+            if failure == "permission":
+                raise PermissionError(errno.EACCES, "private")
+            raise FileNotFoundError(errno.ENOENT, "private")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", missing)
+    if failure == "other-missing":
+        (probe.proc_root / "net/unix").unlink()
+    elif failure == "socket-swap":
+        original_stat = probe.filesystem_socket_stat
+
+        def swapped(path):
+            value = original_stat(path)
+            return SimpleNamespace(
+                **{**vars(value), "st_ino": value.st_ino + len(calls)}
+            )
+
+        monkeypatch.setattr(probe, "filesystem_socket_stat", swapped)
+
+    def advance(delay):
+        assert failure in {"deadline", "restart", "start-time", "exit"}, (
+            "hard error retried"
+        )
+        now[0] += delay
+        if failure == "restart":
+            values["InvocationID"] = "b" * 32
+        elif failure == "start-time":
+            (probe.proc_root / "123/stat").write_bytes(
+                b"123 (python) " + b"0 " * 19 + b"9999\n"
+            )
+        elif failure == "exit":
+            values.update(ActiveState="failed", SubState="dead", MainPID="0")
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if failure in {"deadline", "exit"}
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    assert [json.loads(s.split(" ", 1)[1])["phase"] for s in logs] == [
+        "systemctl",
+        "observe",
+    ]
+    if failure == "deadline":
+        assert now[0] == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize(
+    "unit", ("helixweave-redis.service", "helixweave-docker-rootless.service")
+)
+def test_proc_scan_pending_is_not_a_status_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit: str
+) -> None:
+    probe, _ = _unix_socket_probe(tmp_path)
+
+    def missing(_path):
+        raise FileNotFoundError(errno.ENOENT, "gone")
+
+    monkeypatch.setattr(os, "scandir", missing)
+    with pytest.raises(DeploymentError) as caught:
+        probe._socket_witnesses(
+            unit=unit, cgroup="/system.slice/helixweave-redis.service", main_pid=123
+        )
+    assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
 
 
 def _worker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

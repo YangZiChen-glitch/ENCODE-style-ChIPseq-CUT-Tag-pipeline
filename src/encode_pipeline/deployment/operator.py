@@ -8,7 +8,9 @@ path derivation, and public receipts can be tested without systemd or root.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import fcntl
 import grp
 import hashlib
@@ -21,6 +23,7 @@ import socket
 import stat
 import subprocess
 import sys
+import syslog
 import tempfile
 import time
 from typing import Protocol
@@ -1288,6 +1291,10 @@ class _ServiceReadinessPending(Exception):
         self.worker_stages = worker_stages
 
 
+class _ProcScanPending(_ServiceReadinessPending):
+    """Only an ENOENT from enumeration of a procfs PID/FD directory."""
+
+
 class LinuxServiceProbe:
     """Bind systemd, procfs, cgroup, executable, command line, and sockets."""
 
@@ -1519,6 +1526,7 @@ class LinuxServiceProbe:
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
             )
+        scan_pending = False
         try:
             sockets = self._socket_witnesses(
                 unit=unit,
@@ -1526,9 +1534,13 @@ class LinuxServiceProbe:
                 main_pid=main_pid,
                 allow_socket_pending=allow_socket_pending,
             )
-        except _ServiceReadinessPending:
-            if unit != "helixweave-api.service":
+        except _ServiceReadinessPending as pending:
+            if unit not in {
+                "helixweave-api.service",
+                "helixweave-docker-rootless.service",
+            }:
                 raise
+            scan_pending = isinstance(pending, _ProcScanPending)
             # Absence is not a successful observation. Before classifying it as
             # pending, still verify cgroup membership and every stability check.
             sockets = None
@@ -1612,7 +1624,10 @@ class LinuxServiceProbe:
                     worker_stages=(stages[0], stages[1]),
                 )
         if sockets is None:
-            raise _ServiceReadinessPending(
+            pending_type = (
+                _ProcScanPending if scan_pending else _ServiceReadinessPending
+            )
+            raise pending_type(
                 (
                     main_pid,
                     start_ticks,
@@ -1659,6 +1674,7 @@ class LinuxServiceProbe:
                 ),
             )
         path = self.unix_sockets[unit]
+        scan_pending = False
         try:
             try:
                 before = self.filesystem_socket_stat(path)
@@ -1675,8 +1691,18 @@ class LinuxServiceProbe:
             pids_before = self._cgroup_pids(cgroup)
             if main_pid not in pids_before:
                 raise OSError
-            if not self._pids_own_socket(pids_before, kernel_inode):
-                raise OSError
+            try:
+                if not self._pids_own_socket(pids_before, kernel_inode):
+                    raise OSError
+            except _ProcScanPending:
+                if (
+                    not allow_socket_pending
+                    or unit != "helixweave-docker-rootless.service"
+                ):
+                    raise OSError from None
+                # Discard all ownership results. The outer observer must still
+                # prove the main process stable before allowing a fresh scan.
+                scan_pending = True
             pids_after = self._cgroup_pids(cgroup)
             after = self.filesystem_socket_stat(path)
         except _ServiceReadinessPending:
@@ -1686,11 +1712,17 @@ class LinuxServiceProbe:
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service socket could not be observed.",
             ) from None
-        if _file_witness(before) != _file_witness(after) or pids_before != pids_after:
+        if (
+            _file_witness(before) != _file_witness(after)
+            or main_pid not in pids_after
+            or (not scan_pending and pids_before != pids_after)
+        ):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service socket could not be observed.",
             )
+        if scan_pending:
+            raise _ProcScanPending
         return (
             SocketWitness(
                 names[0],
@@ -1819,11 +1851,15 @@ class LinuxServiceProbe:
                             raise OSError
                         try:
                             target = os.readlink(descriptor.path)
-                        except OSError:
+                        except OSError as error:
+                            if error.errno == errno.ENOENT:
+                                raise _ProcScanPending from None
                             raise OSError from None
                         if target == f"socket:[{inode}]":
                             owned = True
-            except OSError:
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    raise _ProcScanPending from None
                 raise OSError from None
         return owned
 
@@ -1937,19 +1973,59 @@ class SystemdServiceController:
             if request.unit in _READINESS_UNITS
             else None
         )
-        self.systemctl.control("start", request.unit)
-        service = self._observe_started_service(
-            request,
-            readiness_deadline=readiness_deadline,
-        )
-        if service is None:
-            raise fail(
-                "OPERATOR_SERVICE_START_FAILED",
-                "Service did not enter the running state.",
-                recoverable=True,
+        with self._docker_start_phase(request.unit, "systemctl"):
+            self.systemctl.control("start", request.unit)
+        with self._docker_start_phase(request.unit, "observe"):
+            service = self._observe_started_service(
+                request,
+                readiness_deadline=readiness_deadline,
             )
-        self._persist_started_service(service)
+            if service is None:
+                raise fail(
+                    "OPERATOR_SERVICE_START_FAILED",
+                    "Service did not enter the running state.",
+                    recoverable=True,
+                )
+        with self._docker_start_phase(request.unit, "persist"):
+            self._persist_started_service(service)
         return service
+
+    @contextmanager
+    def _docker_start_phase(self, unit: str, phase: str):
+        """Retain bounded, path-free local diagnostics; never alter receipts."""
+        if unit != "helixweave-docker-rootless.service":
+            yield
+            return
+        started = time.monotonic()
+        code = "OK"
+        try:
+            yield
+        except Exception as error:
+            code = (
+                error.issue.code
+                if isinstance(error, DeploymentError)
+                else "UNEXPECTED_FAILURE"
+            )
+            raise
+        finally:
+            try:
+                syslog.syslog(
+                    syslog.LOG_INFO,
+                    "helixweave-service-start "
+                    + canonical_json_bytes(
+                        {
+                            "phase": phase,
+                            "code": code,
+                            "elapsed_ms": max(
+                                0, int((time.monotonic() - started) * 1000)
+                            ),
+                        }
+                    )
+                    .decode()
+                    .strip(),
+                )
+            except OSError:
+                pass  # Logging cannot change the native operation result.
 
     def _observe_started_service(
         self,
@@ -1985,6 +2061,7 @@ class SystemdServiceController:
                 if request.unit in {
                     "helixweave-api.service",
                     "helixweave-worker.service",
+                    "helixweave-docker-rootless.service",
                 }:
                     if pending.api_process is None or (
                         api_process is not None and pending.api_process != api_process
