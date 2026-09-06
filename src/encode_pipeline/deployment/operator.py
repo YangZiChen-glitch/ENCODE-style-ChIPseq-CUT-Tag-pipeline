@@ -157,6 +157,12 @@ _SERVICE_READINESS_POLL_SECONDS = 0.1
 _READINESS_UNITS = (
     "helixweave-docker-rootless.service",
     "helixweave-api.service",
+    "helixweave-worker.service",
+)
+# This reader supports the existing, unchanged candidate launcher, including
+# journal-bound older releases. Never infer executable/argv from a live process.
+_WORKER_LAUNCHER_SHA256 = (
+    "9665d1c245604e90347c42e1216d7f2e223d24008ffbe7473e511af9f24ba904"
 )
 _BULK_RUNTIME_SYSTEMD_TIMEOUT_SECONDS = 14_700.0
 _MAX_COMMAND_OUTPUT = 64 * 1024
@@ -1270,11 +1276,16 @@ class ServiceProbe(Protocol):
 
 
 class _ServiceReadinessPending(Exception):
-    """A socket-bearing service is running but has not begun listening."""
+    """A verified process has not reached its fixed service entry point."""
 
-    def __init__(self, api_process: tuple[int, int, str, str] | None = None) -> None:
+    def __init__(
+        self,
+        api_process: tuple[int, int, str, str] | None = None,
+        worker_stages: tuple[int, int] | None = None,
+    ) -> None:
         super().__init__()
         self.api_process = api_process
+        self.worker_stages = worker_stages
 
 
 class LinuxServiceProbe:
@@ -1302,10 +1313,15 @@ class LinuxServiceProbe:
         cgroup_root: Path = Path("/sys/fs/cgroup"),
         unix_sockets: dict[str, Path] | None = None,
         filesystem_socket_stat: Callable[[Path], os.stat_result] | None = None,
+        layout: DeploymentLayout | None = None,
+        owner_uid: int = 0,
+        owner_gid: int = 0,
     ) -> None:
         self.systemctl = systemctl
         self.proc_root = proc_root
         self.cgroup_root = cgroup_root
+        self.layout = DeploymentLayout.supported() if layout is None else layout
+        self.owner_uid, self.owner_gid = owner_uid, owner_gid
         self.unix_sockets = (
             dict(self._UNIX_SOCKETS) if unix_sockets is None else dict(unix_sockets)
         )
@@ -1344,7 +1360,7 @@ class LinuxServiceProbe:
         deployment_identity: str,
         task_identity: str,
     ) -> ServiceIdentity | None:
-        """Distinguish only absent readiness for the two bounded-start units."""
+        """Distinguish only verified pending states of bounded-start units."""
 
         if unit not in _READINESS_UNITS:
             return self.observe(
@@ -1358,6 +1374,81 @@ class LinuxServiceProbe:
             task_identity=task_identity,
             allow_socket_pending=True,
         )
+
+    def _worker_launch_forms(
+        self, deployment_identity: str
+    ) -> tuple[tuple[bytes, os.stat_result], ...]:
+        """Read the selected release's launcher contract without executing it."""
+        manifest = BundleStore(self.layout).read_installed_manifest(
+            PLATFORM,
+            deployment_identity,
+            expected_owner_uid=self.owner_uid,
+            expected_owner_gid=self.owner_gid,
+        )
+        release = self.layout.platform_releases / deployment_identity
+        relative = "payload/platform/bin/helixweave-service"
+        record = next((f for f in manifest.files if f.path == relative), None)
+        binary = release / relative
+        for parent in (
+            binary.parent,
+            binary.parent.parent,
+            binary.parent.parent.parent,
+        ):
+            observed = parent.lstat()
+            if not stat.S_ISDIR(observed.st_mode) or (
+                observed.st_uid,
+                observed.st_gid,
+                stat.S_IMODE(observed.st_mode),
+            ) != (self.owner_uid, self.owner_gid, 0o555):
+                raise OSError
+        content, observed = read_regular_file(
+            binary, max_bytes=64 * 1024, code="OPERATOR_SERVICE_OBSERVE_FAILED"
+        )
+        if (
+            record is None
+            or record.mode != 0o555
+            or record.size_bytes != len(content)
+            or record.sha256 != hashlib.sha256(content).hexdigest()
+            or record.sha256 != _WORKER_LAUNCHER_SHA256
+            or (observed.st_uid, observed.st_gid, stat.S_IMODE(observed.st_mode))
+            != (self.owner_uid, self.owner_gid, 0o555)
+        ):
+            raise OSError
+        # Validate the dispatcher bytes through the existing stable boundary.
+        verify_stable_operator_boundary()
+        python = "/usr/bin/python3.12"
+        site_packages = release / "payload/platform/lib/python3.12/site-packages"
+        bootstrap = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(site_packages)!r})\n"
+            "from pathlib import Path\n"
+            "from encode_pipeline.deployment.platform_runtime import candidate_service_main\n"
+            "raise SystemExit(candidate_service_main(('worker',), "
+            f"release_root=Path({str(release)!r})))\n"
+        )
+        commands = (
+            (
+                "/usr/bin/python3",
+                "-I",
+                "/usr/libexec/helixweave-active-service",
+                "worker",
+            ),
+            (python, "-I", str(binary), "worker"),
+            (python, "-I", "-S", "-c", bootstrap),
+        )
+        forms = []
+        for argv in commands:
+            executable = Path(argv[0]).stat()
+            if (
+                not stat.S_ISREG(executable.st_mode)
+                or executable.st_uid != 0
+                or executable.st_gid != 0
+                or executable.st_mode & 0o022
+                or not executable.st_mode & 0o111
+            ):
+                raise OSError
+            forms.append((b"\0".join(a.encode() for a in argv) + b"\0", executable))
+        return tuple(forms)
 
     def _observe(
         self,
@@ -1396,6 +1487,11 @@ class LinuxServiceProbe:
                 "Service status could not be observed.",
             )
         try:
+            worker_forms = (
+                self._worker_launch_forms(deployment_identity)
+                if allow_socket_pending and unit == "helixweave-worker.service"
+                else None
+            )
             process = self.proc_root / str(main_pid)
             raw_stat = (process / "stat").read_bytes()
             closing = raw_stat.rfind(b")")
@@ -1404,7 +1500,9 @@ class LinuxServiceProbe:
             executable = (process / "exe").stat()
             cmdline = (process / "cmdline").read_bytes()
             boot = (self.proc_root / "sys/kernel/random/boot_id").read_bytes()
-        except (OSError, ValueError, IndexError):
+            if worker_forms is not None:
+                worker_status = (process / "status").read_bytes()
+        except (OSError, ValueError, IndexError, StableBoundaryError):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
@@ -1444,7 +1542,20 @@ class LinuxServiceProbe:
             final_start_ticks = int(final_fields[19])
             final_executable = (process / "exe").stat()
             final_cmdline = (process / "cmdline").read_bytes()
-        except (OSError, ValueError, IndexError):
+            if worker_forms is not None:
+                final_worker_status = (process / "status").read_bytes()
+                account = pwd.getpwnam("helixweave")
+                for raw_status in (worker_status, final_worker_status):
+                    fields = dict(
+                        line.split(b":", 1) for line in raw_status.splitlines()
+                    )
+                    if fields[b"Uid"].split() != [str(account.pw_uid).encode()] * 4 or (
+                        fields[b"Gid"].split() != [str(account.pw_gid).encode()] * 4
+                    ):
+                        raise OSError
+                if main_pid not in self._cgroup_pids(expected_cgroup):
+                    raise OSError
+        except (OSError, ValueError, IndexError, KeyError):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
@@ -1453,13 +1564,53 @@ class LinuxServiceProbe:
             final_closing < 1
             or final_values != values
             or final_start_ticks != start_ticks
-            or _file_witness(final_executable) != _file_witness(executable)
-            or final_cmdline != cmdline
+            or (
+                worker_forms is None
+                and (
+                    _file_witness(final_executable) != _file_witness(executable)
+                    or final_cmdline != cmdline
+                )
+            )
         ):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
             )
+        if worker_forms is not None:
+            stages = []
+            for command, binary in (
+                (cmdline, executable),
+                (final_cmdline, final_executable),
+            ):
+                stage = next(
+                    (
+                        i
+                        for i, (expected_command, expected_binary) in enumerate(
+                            worker_forms
+                        )
+                        if command == expected_command
+                        and _file_witness(binary) == _file_witness(expected_binary)
+                    ),
+                    None,
+                )
+                if stage is None or (stages and stage < stages[-1]):
+                    raise fail(
+                        "OPERATOR_SERVICE_OBSERVE_FAILED",
+                        "Service status could not be observed.",
+                    )
+                stages.append(stage)
+            # Even a legitimate exec within this observation is not success:
+            # require another full observation of the final fixed entry point.
+            if stages != [2, 2]:
+                raise _ServiceReadinessPending(
+                    (
+                        main_pid,
+                        start_ticks,
+                        _bytes_identity(values["InvocationID"].encode()),
+                        _bytes_identity(boot.strip()),
+                    ),
+                    worker_stages=(stages[0], stages[1]),
+                )
         if sockets is None:
             raise _ServiceReadinessPending(
                 (
@@ -1741,7 +1892,13 @@ class SystemdServiceController:
     ) -> None:
         self.layout = layout
         self.systemctl = FixedSystemctl() if systemctl is None else systemctl
-        self.probe = LinuxServiceProbe(self.systemctl) if probe is None else probe
+        self.probe = (
+            LinuxServiceProbe(
+                self.systemctl, layout=layout, owner_uid=owner_uid, owner_gid=owner_gid
+            )
+            if probe is None
+            else probe
+        )
         self.owner_uid = owner_uid
         self.owner_gid = owner_gid
 
@@ -1791,6 +1948,7 @@ class SystemdServiceController:
         observer = getattr(self.probe, "observe_starting", self.probe.observe)
         assert readiness_deadline is not None
         api_process = None
+        worker_stage = -1
         while True:
             if time.monotonic() >= readiness_deadline:
                 raise fail(
@@ -1805,7 +1963,10 @@ class SystemdServiceController:
                     task_identity=request.task_identity,
                 )
             except _ServiceReadinessPending as pending:
-                if request.unit == "helixweave-api.service":
+                if request.unit in {
+                    "helixweave-api.service",
+                    "helixweave-worker.service",
+                }:
                     if pending.api_process is None or (
                         api_process is not None and pending.api_process != api_process
                     ):
@@ -1814,6 +1975,15 @@ class SystemdServiceController:
                             "Service status could not be observed.",
                         ) from None
                     api_process = pending.api_process
+                if request.unit == "helixweave-worker.service":
+                    if pending.worker_stages is None or (
+                        pending.worker_stages[0] < worker_stage
+                    ):
+                        raise fail(
+                            "OPERATOR_SERVICE_OBSERVE_FAILED",
+                            "Service status could not be observed.",
+                        ) from None
+                    worker_stage = pending.worker_stages[1]
                 remaining = readiness_deadline - time.monotonic()
                 if remaining <= 0:
                     raise fail(
@@ -1858,10 +2028,17 @@ class SystemdServiceController:
     def recover_observe(self, request: OperatorRequest) -> ServiceIdentity | None:
         """Adopt a running service only under an authoritative recovery journal."""
         assert request.unit is not None
-        service = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=request.task_identity,
+        service = (
+            self._observe_started_service(
+                request,
+                readiness_deadline=time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS,
+            )
+            if request.unit == "helixweave-worker.service"
+            else self.probe.observe(
+                unit=request.unit,
+                deployment_identity=request.deployment_identity,
+                task_identity=request.task_identity,
+            )
         )
         if service is None:
             return None

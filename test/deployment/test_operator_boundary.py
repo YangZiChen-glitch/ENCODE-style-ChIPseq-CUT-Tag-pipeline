@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import importlib.util
 import hashlib
@@ -926,7 +926,7 @@ def test_socket_service_start_readiness_wait_is_bounded(
         def observe_starting(self, **_kwargs):
             self.starting_calls += 1
             raise operator_module._ServiceReadinessPending(
-                (123, 456, IDENTITY, IDENTITY)
+                (123, 456, IDENTITY, IDENTITY), worker_stages=(0, 0)
             )
 
     class RecordingSystemctl:
@@ -1028,11 +1028,17 @@ def test_socket_service_start_does_not_retry_hard_identity_failure(
     assert probe.starting_calls == 1
 
 
-def test_non_docker_service_start_keeps_single_observation_behavior(
+def test_redis_start_keeps_single_observation_behavior(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = _worker_service_identity()
+    unit = "helixweave-redis.service"
+    fields = _worker_service_identity().to_dict()
+    for key in ("identity", "unit", "sockets"):
+        fields.pop(key)
+    service = ServiceIdentity.create(
+        **fields, unit=unit, sockets=(SocketWitness("redis-queue", 1, 2, 3),)
+    )
 
     class SequencedProbe:
         observe_calls = 0
@@ -1042,7 +1048,7 @@ def test_non_docker_service_start_keeps_single_observation_behavior(
             return None if self.observe_calls == 1 else service
 
         def observe_starting(self, **_kwargs):
-            pytest.fail("non-Docker start used readiness polling")
+            pytest.fail("Redis start used readiness polling")
 
     probe = SequencedProbe()
     persisted: list[ServiceIdentity] = []
@@ -1063,7 +1069,7 @@ def test_non_docker_service_start_keeps_single_observation_behavior(
     observed = controller.start(
         OperatorRequest(
             operation="start",
-            unit="helixweave-worker.service",
+            unit=unit,
             deployment_identity=IDENTITY,
             task_identity=TASK_IDENTITY,
         )
@@ -1655,6 +1661,191 @@ def test_api_start_waits_for_same_invocation_then_persists_once(
     assert now[0] == 0.1
     assert observed.main_pid == 123
     assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
+
+
+def _worker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    controller, probe, _request, values = _api_start_probe(tmp_path, monkeypatch)
+    unit = "helixweave-worker.service"
+    group = probe.cgroup_root / "system.slice" / unit
+    group.mkdir()
+    (group / "cgroup.procs").write_text("123\n")
+    process = probe.proc_root / "123"
+    (process / "status").write_text("Uid:\t123 123 123 123\nGid:\t456 456 456 456\n")
+    monkeypatch.setattr(
+        operator_module.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=123, pw_gid=456),
+    )
+    values["ControlGroup"] = f"/system.slice/{unit}"
+    forms = tuple(
+        (command, (process / "exe").stat())
+        for command in (
+            b"verified-dispatcher\0",
+            b"verified-candidate-launcher\0",
+            b"verified-final\0",
+        )
+    )
+    (process / "cmdline").write_bytes(forms[0][0])
+    monkeypatch.setattr(
+        probe,
+        "_worker_launch_forms",
+        lambda identity: forms if identity == IDENTITY else (),
+    )
+
+    def start(action, name):
+        assert (action, name) == ("start", unit)
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+
+    probe.systemctl.control = start
+    request = OperatorRequest(
+        operation="start",
+        unit=unit,
+        deployment_identity=IDENTITY,
+        task_identity=TASK_IDENTITY,
+    )
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    return controller, probe, request, values, forms, now
+
+
+def test_worker_argv_is_derived_from_bound_release_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relative = "payload/platform/bin/helixweave-service"
+    content = (TEMPLATES / "helixweave-service").read_bytes()
+    manifest, payload = manifest_for("platform", extra_payload={relative: content})
+    manifest = type(manifest).create(
+        component=manifest.component,
+        contracts=manifest.contracts,
+        files=tuple(
+            replace(f, mode=0o555) if f.path == relative else f for f in manifest.files
+        ),
+    )
+    bundle = tmp_path / "platform.tar"
+    write_bundle(bundle, manifest, payload)
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    BundleStore(layout).stage(bundle)
+    probe = LinuxServiceProbe(
+        SimpleNamespace(), layout=layout, owner_uid=os.getuid(), owner_gid=os.getgid()
+    )
+    monkeypatch.setattr(
+        operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
+    )
+    forms = probe._worker_launch_forms(manifest.identity)
+    release = layout.platform_releases / manifest.identity
+    main = runpy.run_path(str(TEMPLATES / "helixweave-service"))["main"]
+    calls = []
+    monkeypatch.setitem(
+        main.__globals__,
+        "_fixed_release",
+        lambda: (release, release / "payload/platform/lib/python3.12/site-packages"),
+    )
+    monkeypatch.setattr(
+        os, "execve", lambda executable, argv, env: calls.append((executable, argv))
+    )
+    assert main(("worker",)) == 70  # execve was recorded, not executed.
+    assert forms[2][0] == b"\0".join(a.encode() for a in calls[0][1]) + b"\0"
+    assert str(release).encode() in forms[1][0] and str(release).encode() in forms[2][0]
+    binary = release / relative
+    binary.chmod(0o755)
+    binary.write_bytes(content + b"# drift\n")
+    binary.chmod(0o555)
+    with pytest.raises(OSError):
+        probe._worker_launch_forms(manifest.identity)
+
+
+@pytest.mark.parametrize(
+    ("method", "exec_during_observation"),
+    (("start", False), ("start", True), ("recover_observe", False)),
+)
+def test_worker_start_only_persists_final_verified_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    exec_during_observation: bool,
+) -> None:
+    controller, probe, request, values, forms, now = _worker_start_probe(
+        tmp_path, monkeypatch
+    )
+    if method == "recover_observe":
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+    persisted = []
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    command = probe.proc_root / "123/cmdline"
+    if exec_during_observation:
+        original = probe._socket_witnesses
+
+        def exec_to_launcher(**kwargs):
+            result = original(**kwargs)
+            if command.read_bytes() == forms[0][0]:
+                command.write_bytes(forms[1][0])
+            return result
+
+        monkeypatch.setattr(probe, "_socket_witnesses", exec_to_launcher)
+
+    def advance(delay):
+        assert not persisted
+        now[0] += delay
+        stage = next(
+            i for i, form in enumerate(forms) if form[0] == command.read_bytes()
+        )
+        command.write_bytes(forms[min(stage + 1, 2)][0])
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    observed = getattr(controller, method)(request)
+    assert persisted == [observed]
+    assert (
+        observed.cmdline_identity == "sha256-" + hashlib.sha256(forms[2][0]).hexdigest()
+    )
+    assert observed.main_pid == 123 and observed.process_start_ticks == 5678
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("wrong-candidate", "unknown", "exec-unknown", "restart", "exit", "stuck"),
+)
+def test_worker_start_fails_closed_without_persisting_transient_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    controller, probe, request, values, _forms, now = _worker_start_probe(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    command = probe.proc_root / "123/cmdline"
+    if failure == "wrong-candidate":
+        request = replace(request, deployment_identity=OLD_PLATFORM_IDENTITY)
+    elif failure == "unknown":
+        command.write_bytes(b"foreign-command\0")
+    elif failure == "exec-unknown":
+        original = probe._socket_witnesses
+
+        def unknown_exec(**kwargs):
+            result = original(**kwargs)
+            command.write_bytes(b"foreign-command\0")
+            return result
+
+        monkeypatch.setattr(probe, "_socket_witnesses", unknown_exec)
+
+    def advance(delay):
+        assert failure in {"stuck", "restart", "exit"}, "hard mismatch retried"
+        now[0] += delay
+        if failure == "restart":
+            values["InvocationID"] = "b" * 32
+        elif failure == "exit":
+            values.update(ActiveState="failed", SubState="dead", MainPID="0")
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if failure in {"stuck", "exit"}
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    if failure == "stuck":
+        assert now[0] == pytest.approx(15.0)
 
 
 @pytest.mark.parametrize(
