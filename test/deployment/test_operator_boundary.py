@@ -48,6 +48,7 @@ from encode_pipeline.deployment.operator import (
     SystemdBulkRuntimePreparer,
     UNINSTALL_BOUNDARY_FILES,
     UNINSTALL_LINKED_BOUNDARY_TARGETS,
+    WRITER_UNITS,
     ServiceIdentity,
     SocketWitness,
     bundle_ingress_path,
@@ -352,6 +353,10 @@ def test_non_stage_requests_cannot_derive_an_ingress_path() -> None:
 class FakeServiceController:
     service: ServiceIdentity | None = None
     stopped: tuple[str, bool] | None = None
+
+    def prepare_redis_transfer(self, **kwargs):
+        assert self.service is None or self.service.unit != "helixweave-redis.service"
+        return None
 
     def start(self, request: OperatorRequest) -> ServiceIdentity:
         assert self.service is not None
@@ -2963,6 +2968,10 @@ class _FreshServices:
         assert self.running is not None
         return self.running.get(request.unit)
 
+    def prepare_redis_transfer(self, **kwargs):
+        assert not self.running or "helixweave-redis.service" not in self.running
+        return None
+
     def stop(self, request, *, cleanup):
         assert self.running is not None
         assert not cleanup
@@ -2985,6 +2994,10 @@ class _TrackingServices:
     calls: list[tuple[str, str, str]]
     fail_start_once: str | None = None
     start_failed: bool = False
+
+    def prepare_redis_transfer(self, **kwargs):
+        assert "helixweave-redis.service" not in self.running
+        return None
 
     @staticmethod
     def _identity(request: OperatorRequest):
@@ -3041,6 +3054,352 @@ class _TrackingServices:
         service = self._identity(request)
         self.running[request.unit] = service
         return service
+
+
+class _RetainedRedisServices(SystemdServiceController):
+    """Real status/atomic identity writer; task-only process and queue fixture."""
+
+    unit = "helixweave-redis.service"
+
+    def __init__(self, layout):
+        self.writers = _TrackingServices({}, [])
+        self.queue = [b"task-only-queued-job", b"task-only-scheduled-job"]
+        self.physical = ServiceIdentity.create(
+            **{
+                **{
+                    key: value
+                    for key, value in _worker_service_identity().to_dict().items()
+                    if key != "identity"
+                },
+                "unit": self.unit,
+                "deployment_identity": OLD_PLATFORM_IDENTITY,
+                "sockets": (SocketWitness("redis-queue", 21, 22, 23),),
+            }
+        )
+        super().__init__(
+            layout,
+            probe=self,
+            systemctl=self,
+            owner_uid=os.getuid(),
+            owner_gid=os.getgid(),
+        )
+        layout.service_identities.mkdir(parents=True, mode=0o700)
+        self._write_identity(self.physical)
+        self.writes = 0
+        self.incompatible = None
+        for unit in WRITER_UNITS:
+            request = OperatorRequest(
+                operation="start",
+                unit=unit,
+                deployment_identity=OLD_PLATFORM_IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+            self.writers.running[unit] = self.writers._identity(request)
+
+    def observe(self, *, unit, deployment_identity, task_identity):
+        assert unit == self.unit
+        value = self._redis_bound_to(self.physical, deployment_identity)
+        assert value.task_identity == task_identity
+        return value
+
+    def control(self, action, unit):
+        self.queue.clear()
+        raise AssertionError("retained Redis must never be controlled")
+
+    def _redis_requirements(self, deployment):
+        return (
+            ("different" if deployment == self.incompatible else "same", 10, 0o444),
+        )
+
+    def _write_identity(self, service):
+        super()._write_identity(service)
+        if hasattr(self, "writes"):
+            self.writes += 1
+
+    def status(self, request):
+        if request.unit == self.unit:
+            return super().status(request)
+        return self.writers.status(request)
+
+    def start(self, request):
+        assert request.unit != self.unit
+        return self.writers.start(request)
+
+    def stop(self, request, *, cleanup):
+        assert request.unit != self.unit
+        return self.writers.stop(request, cleanup=cleanup)
+
+
+@pytest.mark.parametrize("drift", (None, "redis.conf", "helixweave-redis.service"))
+def test_retained_redis_requires_manifest_bound_installed_configuration(
+    tmp_path, monkeypatch, drift
+):
+    prefix = "payload/platform/lib/python3.12/site-packages/encode_pipeline/deployment/templates/"
+    files = {}
+    targets = {}
+    for installed in (
+        Path("/etc/helixweave/redis.conf"),
+        Path("/usr/lib/systemd/system/helixweave-redis.service"),
+    ):
+        target = tmp_path / installed.name
+        content = (TEMPLATES / installed.name).read_bytes()
+        target.write_bytes(content)
+        target.chmod(0o444)
+        targets[installed] = target
+        files[prefix + installed.name] = (
+            content if drift != installed.name else content + b"# incompatible\n"
+        )
+    manifest, _ = manifest_for("platform", extra_payload=files)
+    monkeypatch.setattr(
+        BundleStore, "read_installed_manifest", lambda *a, **kw: manifest
+    )
+    monkeypatch.setattr(
+        operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
+    )
+    monkeypatch.setattr(operator_module, "UNINSTALL_LINKED_BOUNDARY_TARGETS", targets)
+    lstat = Path.lstat
+    readlink = os.readlink
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda p: (
+            SimpleNamespace(
+                st_mode=stat.S_IFLNK | 0o777,
+                st_uid=os.getuid(),
+                st_gid=os.getgid(),
+                st_nlink=1,
+            )
+            if p in targets
+            else lstat(p)
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "readlink",
+        lambda p, **kw: str(targets[p]) if p in targets else readlink(p, **kw),
+    )
+    services = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    if drift:
+        with pytest.raises(DeploymentError, match="DEPLOYMENT_COMPATIBILITY_FAILED"):
+            services._redis_requirements(manifest.identity)
+    else:
+        signature = services._redis_requirements(manifest.identity)
+        assert len(signature) == 2
+        assert all(mode == 0o444 for _, _, mode in signature)
+
+
+def _redis_platform_transaction_fixture(tmp_path):
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    states, prior = _state_with_active_components(
+        layout,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+        staged_component="platform",
+        staged_identity=IDENTITY,
+    )
+    _write_operator_test_database(layout, heads=("schema-v1",), value="preserved")
+    services = _RetainedRedisServices(layout)
+    controller = HostDeploymentActionController(
+        layout,
+        states=states,
+        services=services,
+        action_runner=_FreshActionRunner(target_schema="schema-v1"),
+        database_preparer=_FreshDatabasePreparer(layout, os.getuid(), os.getgid()),
+        encode_runtime_preparer=_FreshRuntimePreparer(),
+        configuration=_FreshConfiguration([], layout),
+        root_uid=os.getuid(),
+        root_gid=os.getgid(),
+        service_uid=os.getuid(),
+        service_gid=os.getgid(),
+    )
+    journals = OperatorJournalStore(
+        layout,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+        recovery_controller=controller,
+    )
+    return layout, states, prior, services, controller, journals
+
+
+def _run_platform_transaction(
+    controller, journals, *, operation="activate", identity=IDENTITY, task=TASK_IDENTITY
+):
+    with journals.operation(
+        operation=operation,
+        task_identity=task,
+        deployment_identity=identity,
+        component="platform",
+        unit=None,
+    ) as journal:
+        controller.execute(
+            OperatorRequest(
+                operation=operation,
+                component="platform",
+                deployment_identity=identity,
+                task_identity=task,
+            ),
+            journal=journal,
+        )
+        journal.complete()
+
+
+def _assert_redis_status(services, identity):
+    observed = services.status(
+        OperatorRequest(
+            operation="status",
+            unit=services.unit,
+            deployment_identity=identity,
+            task_identity=TASK_IDENTITY,
+        )
+    )
+    assert observed == services._redis_bound_to(services.physical, identity)
+    assert services.queue == [b"task-only-queued-job", b"task-only-scheduled-job"]
+    return observed
+
+
+def test_platform_upgrade_rollback_and_status_preserve_retained_redis(tmp_path):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    before = services.physical.to_dict()
+    _run_platform_transaction(controller, journals)
+    upgraded = _assert_redis_status(services, IDENTITY)
+    assert upgraded.task_identity == services.physical.task_identity
+    assert services.writes == 1
+    _run_platform_transaction(
+        controller,
+        journals,
+        operation="rollback",
+        identity=OLD_PLATFORM_IDENTITY,
+        task="task-" + "4" * 32,
+    )
+    _assert_redis_status(services, OLD_PLATFORM_IDENTITY)
+    assert services.writes == 2
+    assert services.physical.to_dict() == before
+    assert _database_value(layout) == "preserved"
+    for unit in WRITER_UNITS:
+        assert (
+            services.writers.running[unit].deployment_identity == OLD_PLATFORM_IDENTITY
+        )
+    assert (
+        states.read().components["bulk-rnaseq-runtime"]
+        == prior.components["bulk-rnaseq-runtime"]
+    )
+    assert (
+        states.read().components["encode-runtime"] == prior.components["encode-runtime"]
+    )
+
+
+def test_new_platform_transaction_repairs_completed_legacy_redis_binding(tmp_path):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    _run_platform_transaction(controller, journals)
+    history = layout.operator_transaction_history / f"{TASK_IDENTITY}.json"
+    completed_bytes = history.read_bytes()
+    # Reproduce the old implementation's saved identity after completed upgrade.
+    services._write_identity(services.physical)
+    before = services._identity_path(services.unit).read_bytes()
+    with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+        _assert_redis_status(services, IDENTITY)
+    assert services._identity_path(services.unit).read_bytes() == before
+    with states.transaction(
+        exclusive=True, expected_owner_uid=os.getuid(), expected_owner_gid=os.getgid()
+    ) as transaction:
+        current = transaction.read()
+        transaction.commit(
+            current.stage("platform", THIRD_IDENTITY),
+            operation="stage-platform",
+            expected_current_identity=current.identity,
+        )
+    _run_platform_transaction(
+        controller, journals, identity=THIRD_IDENTITY, task="task-" + "5" * 32
+    )
+    _assert_redis_status(services, THIRD_IDENTITY)
+    assert history.read_bytes() == completed_bytes
+    assert json.loads(completed_bytes)["phase"] == "complete"
+
+
+@pytest.mark.parametrize("mismatch", ("process", "configuration", "unknown-binding"))
+def test_retained_redis_transfer_rejects_untrusted_process_or_configuration(
+    tmp_path, mismatch
+):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    before = services._identity_path(services.unit).read_bytes()
+    if mismatch == "process":
+        raw = services.physical.to_dict()
+        del raw["identity"]
+        raw.update(main_pid=9999, sockets=services.physical.sockets)
+        services.physical = ServiceIdentity.create(**raw)
+    elif mismatch == "configuration":
+        services.incompatible = IDENTITY
+    else:
+        services._write_identity(
+            services._redis_bound_to(services.physical, THIRD_IDENTITY)
+        )
+        before = services._identity_path(services.unit).read_bytes()
+    with pytest.raises(DeploymentError):
+        _run_platform_transaction(controller, journals)
+    assert states.read().identity == prior.identity
+    assert services._identity_path(services.unit).read_bytes() == before
+    assert services.queue == [b"task-only-queued-job", b"task-only-scheduled-job"]
+    assert not any(call[0] in {"start", "stop"} for call in services.writers.calls)
+
+
+@pytest.mark.parametrize(
+    "interrupt", ("state-committed", "binding-written", "post-ponr")
+)
+def test_retained_redis_binding_interruption_recovers_idempotently(
+    tmp_path, monkeypatch, interrupt
+):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    # Leave the journal in recovery-required, as an interrupted operator would.
+    journals.recovery_controller = None
+    with monkeypatch.context() as patch:
+        if interrupt == "post-ponr":
+            services.writers.fail_start_once = "helixweave-api.service"
+        else:
+            original = services._write_identity
+
+            def interrupted_write(service):
+                if interrupt == "binding-written":
+                    original(service)
+                raise fail("TEST_BINDING_WRITE_INTERRUPTED", "Interrupted write.")
+
+            patch.setattr(services, "_write_identity", interrupted_write)
+        with pytest.raises(DeploymentError):
+            _run_platform_transaction(controller, journals)
+    record = journals._read(layout.operator_transaction_active)
+    assert record.evidence["retained_redis_identity"] == services.physical.identity
+    recovered = controller.recover(record)
+    assert controller.recover(record) == recovered
+    expected = IDENTITY if interrupt == "post-ponr" else OLD_PLATFORM_IDENTITY
+    _assert_redis_status(services, expected)
+    assert states.read().components["platform"].active == expected
+    assert _database_value(layout) == "preserved"
+    assert services.writes <= 2
+    if interrupt != "post-ponr":
+        # Recovery must not adopt an unknown saved slot while searching for the
+        # candidate/prior writer. The retained queue is still untouched.
+        services.writers.running[WRITER_UNITS[0]] = services.writers._identity(
+            OperatorRequest(
+                operation="start",
+                unit=WRITER_UNITS[0],
+                deployment_identity=THIRD_IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+        )
+        with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+            controller._observe_recovery_service(record, WRITER_UNITS[0])
+        _assert_redis_status(services, expected)
 
 
 def _supported_state_store(

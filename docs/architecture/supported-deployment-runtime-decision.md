@@ -226,6 +226,24 @@ the active platform does not admit is rejected. Previous content, runtime
 closures, evidence, and backups are retained until an explicit future
 retention action; this milestone provides no automatic pruning.
 
+Platform upgrade and rollback retain a running dedicated Redis process. Before
+transferring its saved deployment binding, the operator verifies the complete
+saved process/socket identity and requires both candidates' indexed Redis
+configuration and unit bytes to match the installed fixed boundary. It journals
+the retained identity before switching state, then atomically rebinds it without
+restarting Redis or changing queue contents. Pre-PONR recovery restores the prior
+binding; post-PONR recovery finishes the candidate binding. Repeating the binding
+write is idempotent. Ordinary status remains read-only and rejects stale bindings.
+
+For a completed prerelease upgrade that left Redis bound to the previous Platform,
+use a new normal `helixweave upgrade --component platform --bundle /absolute/candidate.tar`
+or `helixweave rollback --component platform --identity sha256-<previous>`
+transaction with the corrected operator. Only a
+saved identity belonging to the current state's known prior slot and matching the
+actual process and compatible configuration is eligible. The new transaction
+records the transfer; completed history is neither reopened nor rewritten. Unknown
+processes and incompatible configurations remain fail-closed.
+
 An ENCODE runtime is materialized offline directly at its final
 content-addressed prefix, because conda packages may embed that absolute
 prefix in shebangs or binary metadata. The service account consumes only the

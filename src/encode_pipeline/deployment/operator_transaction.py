@@ -53,6 +53,7 @@ TERMINAL_PHASES = frozenset({"complete", "aborted"})
 EVIDENCE_KEYS = frozenset(
     {
         "service_identity",
+        "retained_redis_identity",
         "witness_identity",
         "action_receipt_identity",
         "database_prepare_receipt_identity",

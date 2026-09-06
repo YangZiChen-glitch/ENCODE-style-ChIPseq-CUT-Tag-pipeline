@@ -1865,6 +1865,25 @@ class LinuxServiceProbe:
 
 
 class ServiceController(Protocol):
+    def prepare_redis_transfer(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str | None = None,
+    ) -> ServiceIdentity | None: ...
+
+    def transfer_redis_binding(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str,
+        restore: bool,
+    ) -> None: ...
+
     def start(self, request: OperatorRequest) -> ServiceIdentity: ...
 
     def recover_start(self, request: OperatorRequest) -> ServiceIdentity: ...
@@ -2073,6 +2092,157 @@ class SystemdServiceController:
                 recoverable=True,
             )
         return service
+
+    @staticmethod
+    def _redis_bound_to(service: ServiceIdentity, deployment: str) -> ServiceIdentity:
+        values = service.to_dict()
+        del values["identity"]
+        values["deployment_identity"] = deployment
+        values["sockets"] = service.sockets
+        return ServiceIdentity.create(**values)
+
+    def _redis_requirements(self, deployment: str) -> tuple[tuple[str, int, int], ...]:
+        """Compare candidate requirements with the installed, fixed Redis boundary."""
+        manifest = BundleStore(self.layout).read_installed_manifest(
+            PLATFORM,
+            deployment,
+            expected_owner_uid=self.owner_uid,
+            expected_owner_gid=self.owner_gid,
+        )
+        try:
+            verify_stable_operator_boundary()
+            signature = []
+            for installed in (
+                Path("/etc/helixweave/redis.conf"),
+                Path("/usr/lib/systemd/system/helixweave-redis.service"),
+            ):
+                target = UNINSTALL_LINKED_BOUNDARY_TARGETS[installed]
+                link = installed.lstat()
+                if (
+                    not stat.S_ISLNK(link.st_mode)
+                    or link.st_nlink != 1
+                    or (link.st_uid, link.st_gid) != (self.owner_uid, self.owner_gid)
+                    or os.readlink(installed) != str(target)
+                ):
+                    raise ValueError
+                content, observed = read_regular_file(
+                    target.resolve(strict=True),
+                    max_bytes=64 * 1024,
+                    code="DEPLOYMENT_COMPATIBILITY_FAILED",
+                )
+                relative = (
+                    "payload/platform/lib/python3.12/site-packages/"
+                    f"encode_pipeline/deployment/templates/{target.name}"
+                )
+                record = next((f for f in manifest.files if f.path == relative), None)
+                if (
+                    record is None
+                    or (
+                        observed.st_uid,
+                        observed.st_gid,
+                        stat.S_IMODE(observed.st_mode),
+                    )
+                    != (self.owner_uid, self.owner_gid, 0o444)
+                    or (record.sha256, record.size_bytes, record.mode)
+                    != (hashlib.sha256(content).hexdigest(), len(content), 0o444)
+                ):
+                    raise ValueError
+                signature.append((record.sha256, record.size_bytes, record.mode))
+            return tuple(signature)
+        except (OSError, ValueError, StableBoundaryError):
+            raise fail(
+                "DEPLOYMENT_COMPATIBILITY_FAILED",
+                "Retained Redis configuration is not compatible.",
+            ) from None
+
+    def prepare_redis_transfer(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str | None = None,
+    ) -> ServiceIdentity | None:
+        """Observe, never adopt, a retained process; return its prior-slot witness.
+
+        A saved previous-slot binding is accepted only inside a new Platform
+        transaction. This repairs completed prerelease upgrades without editing
+        their history or turning ordinary status into a mutating operation.
+        """
+        unit = "helixweave-redis.service"
+        saved = self._read_identity(unit, required=False)
+        observed = self.probe.observe(
+            unit=unit,
+            deployment_identity=prior if saved is None else saved.deployment_identity,
+            task_identity="task-" + "0" * 32 if saved is None else saved.task_identity,
+        )
+        if observed is None:
+            return None
+        if (
+            saved is None
+            or observed != saved
+            or saved.deployment_identity
+            not in (
+                {prior, previous} if witness is None else {prior, candidate, previous}
+            )
+        ):
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity does not match this transaction.",
+            )
+        requirements = self._redis_requirements(prior)
+        for deployment in {candidate, saved.deployment_identity} - {prior}:
+            if self._redis_requirements(deployment) != requirements:
+                raise fail(
+                    "DEPLOYMENT_COMPATIBILITY_FAILED",
+                    "Retained Redis configuration is not compatible.",
+                )
+        projected = self._redis_bound_to(saved, prior)
+        if witness is not None and projected.identity != witness:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity changed during the transaction.",
+            )
+        return projected
+
+    def transfer_redis_binding(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str,
+        restore: bool,
+    ) -> None:
+        observed = self.prepare_redis_transfer(
+            prior=prior,
+            candidate=candidate,
+            previous=previous,
+            witness=witness,
+        )
+        if observed is None or observed.identity != witness:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity changed during the transaction.",
+            )
+        rebound = self._redis_bound_to(observed, prior if restore else candidate)
+        if self._read_identity(rebound.unit, required=True) != rebound:
+            # A persistence failure is recovered by the enclosing journal. Do
+            # not use start's persistence cleanup: stopping Redis loses queues.
+            self._write_identity(rebound)
+        confirmed = self.status(
+            OperatorRequest(
+                operation=STATUS,
+                unit=rebound.unit,
+                deployment_identity=rebound.deployment_identity,
+                task_identity=rebound.task_identity,
+            )
+        )
+        if confirmed != rebound:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity changed during the transaction.",
+            )
 
     def stop(self, request: OperatorRequest, *, cleanup: bool) -> None:
         assert request.unit is not None and request.service_identity is not None
@@ -3210,6 +3380,9 @@ class HostDeploymentActionController:
                     "action_receipt_identity": admission.identity,
                 },
             )
+            self._transfer_retained_redis(
+                journal.record, prior_state=state, restore=False
+            )
         self._restart_services(
             stopped,
             candidate=candidate,
@@ -3510,6 +3683,7 @@ class HostDeploymentActionController:
             expected_owner_uid=self.root_uid,
             expected_owner_gid=self.root_gid,
         )
+        self._recover_retained_redis(record, restore=True)
         for unit in record.prior_running_units:
             deployment = self._service_deployment(record.prior_active, unit)
             if deployment is None:
@@ -3569,6 +3743,7 @@ class HostDeploymentActionController:
                 "Operator transaction requires recovery.",
                 recoverable=True,
             )
+        self._recover_retained_redis(record, restore=False)
         for unit in record.restart_units:
             deployment = self._service_deployment(record.candidate_active, unit)
             if deployment is None:
@@ -3662,15 +3837,36 @@ class HostDeploymentActionController:
             deployment = self._service_deployment(active, unit)
             if deployment is not None and deployment not in deployments:
                 deployments.append(deployment)
+        mismatched = False
         for deployment in deployments:
-            observed = self._status_for_recovery(
-                unit=unit,
-                deployment_identity=deployment,
-                task_identity=record.task_identity,
-                tolerate_identity_mismatch=True,
-            )
+            try:
+                observed = self.services.status(
+                    OperatorRequest(
+                        operation=STATUS,
+                        unit=unit,
+                        deployment_identity=deployment,
+                        task_identity=record.task_identity,
+                    )
+                )
+            except DeploymentError as error:
+                if error.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH":
+                    mismatched = True
+                    continue
+                if error.issue.code != "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE":
+                    raise
+                observed = self._status_for_recovery(
+                    unit=unit,
+                    deployment_identity=deployment,
+                    task_identity=record.task_identity,
+                    tolerate_identity_mismatch=False,
+                )
             if observed is not None:
                 return deployment, observed
+        if mismatched:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Running service does not match either recovery slot.",
+            )
         return None
 
     def _restore_database_before_ponr(self, record: OperatorTransaction) -> None:
@@ -4518,6 +4714,54 @@ class HostDeploymentActionController:
             )
         return receipt
 
+    def _recover_retained_redis(
+        self, record: OperatorTransaction, *, restore: bool
+    ) -> None:
+        if "retained_redis_identity" not in record.evidence:
+            return  # Earlier journals did not transfer a retained Redis binding.
+        assert record.prior_state_identity is not None
+        with self.states.transaction(
+            exclusive=False,
+            expected_owner_uid=self.root_uid,
+            expected_owner_gid=self.root_gid,
+        ):
+            prior = self.states._load_generation_locked(
+                record.prior_state_identity,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            )
+            self._transfer_retained_redis(record, prior_state=prior, restore=restore)
+
+    def _transfer_retained_redis(
+        self,
+        record: OperatorTransaction,
+        *,
+        prior_state: DeploymentState,
+        restore: bool,
+    ) -> None:
+        witness = record.evidence.get("retained_redis_identity")
+        if witness is None:
+            return
+        if (
+            record.component != PLATFORM
+            or record.prior_active is None
+            or record.candidate_active is None
+            or record.prior_state_identity != prior_state.identity
+            or record.prior_active[PLATFORM] != prior_state.components[PLATFORM].active
+            or "helixweave-redis.service" in record.restart_units
+        ):
+            raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+        prior = record.prior_active[PLATFORM]
+        candidate = record.candidate_active[PLATFORM]
+        assert prior is not None and candidate is not None
+        self.services.transfer_redis_binding(
+            prior=prior,
+            candidate=candidate,
+            previous=prior_state.components[PLATFORM].previous,
+            witness=witness,
+            restore=restore,
+        )
+
     def _stop_affected_services(
         self,
         *,
@@ -4569,10 +4813,22 @@ class HostDeploymentActionController:
         prior_running_units = tuple(
             unit for unit in SERVICE_UNITS if values.get(unit) is not None
         )
+        retained = None
+        if component == PLATFORM and not start_initial and active_platform is not None:
+            next_platform = candidate.components[PLATFORM].active
+            assert next_platform is not None
+            retained = self.services.prepare_redis_transfer(
+                prior=active_platform,
+                candidate=next_platform,
+                previous=state.components[PLATFORM].previous,
+            )
         journal.advance(
             "service-stopping",
             restart_units=restart_units,
             prior_running_units=prior_running_units,
+            evidence={}
+            if retained is None
+            else {"retained_redis_identity": retained.identity},
         )
         for unit, service in values.items():
             if service is None:
