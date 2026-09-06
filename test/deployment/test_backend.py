@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import encode_pipeline.deployment.backend as backend_module
+import encode_pipeline.deployment.operator as operator_module
 from encode_pipeline.deployment.admission import (
     DeferredDatabaseSchemaObserver,
     DeferredNativeContractResolver,
@@ -192,7 +193,13 @@ def test_operator_client_rejects_extra_or_mismatched_receipt_fields() -> None:
 def test_operator_client_fails_closed_on_untrusted_execution_results(
     failure: str,
     recoverable: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+
     def run(_arguments: tuple[str, ...]) -> object:
         if failure == "exception":
             raise OSError("/private/operator token=secret")
@@ -228,6 +235,23 @@ def test_operator_client_fails_closed_on_untrusted_execution_results(
     assert caught.value.issue.recoverable is recoverable
     assert "private" not in str(caught.value)
     assert "secret" not in str(caught.value)
+    diagnostic = json.loads(logs[-1].split(" ", 1)[1])
+    assert diagnostic["task_identity"] == TASK
+    assert (
+        diagnostic["code"]
+        == {
+            "exception": "EXECUTION_EXCEPTION",
+            "wrong-type": "EXECUTION_TYPE_INVALID",
+            "exit-unavailable": "EXIT_NONZERO",
+            "stderr": "STDERR_PRESENT",
+            "empty": "RECEIPT_SIZE_INVALID",
+            "oversized": "RECEIPT_SIZE_INVALID",
+            "invalid-json": "JSON_INVALID",
+            "duplicate-key": "JSON_INVALID",
+            "noncanonical": "CANONICAL_RECEIPT_INVALID",
+        }[failure]
+    )
+    assert "private" not in "".join(logs) and "secret" not in "".join(logs)
 
 
 def test_operator_client_accepts_stopped_services_and_exact_mutation_receipts() -> None:
@@ -311,7 +335,11 @@ def test_operator_service_observation_rejects_invalid_unit_and_identity_evidence
         assert caught.value.issue.code == "DEPLOYMENT_OPERATOR_UNAVAILABLE"
 
 
-def test_operator_observation_uses_the_fixed_state_bound_grammar() -> None:
+def test_operator_observation_uses_the_fixed_state_bound_grammar(monkeypatch) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
     observation = OperatorObservation.create(
         state_identity=IDENTITY,
         active={
@@ -344,6 +372,13 @@ def test_operator_observation_uses_the_fixed_state_bound_grammar() -> None:
 
     assert result == observation
     assert calls == [("observe", IDENTITY, TASK)]
+    assert [
+        (d["phase"], d["code"])
+        for d in (json.loads(line.split(" ", 1)[1]) for line in logs)
+    ] == [
+        ("operator-parse", "OK"),
+        ("operator-receipt", "OK"),
+    ]
 
 
 def test_operator_observation_preserves_headless_database_identity() -> None:
@@ -732,6 +767,56 @@ class _Operator:
         frontend_identity = backend_module._frontend_identity(status)
         assert frontend_identity is not None
         return _verification(frontend_identity=frontend_identity)
+
+
+@pytest.mark.parametrize("changed_field", ["state_identity", "active"])
+def test_observation_binding_diagnostic_names_only_the_mismatched_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_field: str
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manager = manager_for(layout)
+    manifest, payload = manifest_for(PLATFORM)
+    bundle = write_bundle(tmp_path / "platform.tar", manifest, payload)
+    manager.stage(bundle)
+    operator = _Operator(manager, bundle)
+    original = operator.observe(manager.status().state.identity, TASK)
+    mismatched = OperatorObservation.create(
+        state_identity=(
+            OTHER_IDENTITY
+            if changed_field == "state_identity"
+            else original.state_identity
+        ),
+        active=(
+            {**original.active, PLATFORM: OTHER_IDENTITY}
+            if changed_field == "active"
+            else original.active
+        ),
+        database_schema_identity=original.database_schema_identity,
+        database_schema_heads=original.database_schema_heads,
+        services=original.services,
+    )
+    monkeypatch.setattr(operator, "observe", lambda *_: mismatched)
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    backend = ProductionCommandBackend(
+        layout=layout,
+        manager=manager,
+        operator=operator,
+        ingress=_Ingress([]),
+        task_factory=lambda: TASK,
+    )
+    before = manager.status().state.identity
+    assert backend._operator_observation(manager.status()) is None
+    assert manager.status().state.identity == before
+    assert json.loads(logs[-1].split(" ", 1)[1]) == {
+        "phase": "state-binding",
+        "code": "BINDING_MISMATCH",
+        "task_identity": TASK,
+        "differing_fields": [changed_field],
+    }
+    assert OTHER_IDENTITY not in logs[-1]
 
 
 def test_upgrade_composes_ingress_operator_and_root_state_reread(

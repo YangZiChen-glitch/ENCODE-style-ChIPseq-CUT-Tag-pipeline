@@ -1614,6 +1614,126 @@ def test_linux_service_probe_binds_filesystem_and_kernel_socket_inodes(
     )
 
 
+@pytest.mark.parametrize("connected_first", (True, False))
+def test_unix_listener_ignores_connected_rows_without_changing_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    connected_first: bool,
+) -> None:
+    probe, path = _unix_socket_probe(tmp_path)
+    table = probe.proc_root / "net/unix"
+    header, listener = table.read_text().splitlines()
+    connected = f"00000000: 00000003 00000000 00000000 0001 03 9999 {path}"
+    records = [connected, listener] if connected_first else [listener, connected]
+    table.write_text("\n".join([header, *records]) + "\n")
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+
+    witnesses = probe._socket_witnesses(
+        unit="helixweave-redis.service",
+        cgroup="/system.slice/helixweave-redis.service",
+        main_pid=123,
+    )
+
+    assert witnesses == (SocketWitness("redis-queue", 41, 84, 4567),)
+    assert json.loads(logs[-1].split(" ", 1)[1]) == {
+        "phase": "unix-listener",
+        "code": "OK",
+        "unit": "helixweave-redis.service",
+    }
+    assert str(path) not in "".join(logs)
+
+
+@pytest.mark.parametrize(
+    "case", ("connected-only", "two-listeners", "bad-connected-inode")
+)
+def test_unix_connected_rows_do_not_weaken_unique_listener_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    probe, path = _unix_socket_probe(tmp_path)
+    table = probe.proc_root / "net/unix"
+    header, listener = table.read_text().splitlines()
+    connected = f"00000000: 00000003 00000000 00000000 0001 03 9999 {path}"
+    rows = {
+        "connected-only": [connected],
+        "two-listeners": [listener, listener.replace("4567", "5678"), connected],
+        "bad-connected-inode": [listener, connected.replace("9999", "0")],
+    }
+    table.write_text("\n".join([header, *rows[case]]) + "\n")
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    with pytest.raises(DeploymentError) as caught:
+        probe._socket_witnesses(
+            unit="helixweave-redis.service",
+            cgroup="/system.slice/helixweave-redis.service",
+            main_pid=123,
+        )
+    assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+    assert (
+        json.loads(logs[-1].split(" ", 1)[1])["code"]
+        == {
+            "connected-only": "LISTENER_MISSING",
+            "two-listeners": "LISTENER_AMBIGUOUS",
+            "bad-connected-inode": "UNIX_SOCKET_ROW_INVALID",
+        }[case]
+    )
+
+
+def test_status_diagnostic_identifies_mismatch_without_rebinding_or_leaking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _worker_service_identity()
+    values = saved.to_dict()
+    values.pop("identity")
+    values["main_pid"] += 1
+    observed = ServiceIdentity.create(**values)
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path),
+        probe=SimpleNamespace(observe=lambda **_kw: observed),
+    )
+    monkeypatch.setattr(controller, "_read_identity", lambda *_a, **_kw: saved)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda *_a: pytest.fail("status wrote identity")
+    )
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    request = OperatorRequest(
+        operation="status",
+        unit=saved.unit,
+        deployment_identity=saved.deployment_identity,
+        task_identity=TASK_IDENTITY,
+    )
+    with pytest.raises(DeploymentError) as caught:
+        controller.status(request)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH"
+    assert json.loads(logs[-1].split(" ", 1)[1]) == {
+        "phase": "service-identity",
+        "code": "IDENTITY_MISMATCH",
+        "unit": saved.unit,
+        "task_identity": TASK_IDENTITY,
+        "differing_fields": ["identity", "main_pid"],
+    }
+
+    # Logging is not part of the identity authority or the error outcome.
+    def unavailable_log(*_args):
+        raise OSError("/private/token=secret")
+
+    monkeypatch.setattr(operator_module.syslog, "syslog", unavailable_log)
+    with pytest.raises(DeploymentError) as caught:
+        controller.status(request)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH"
+    assert "secret" not in str(caught.value)
+
+
 def _api_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     probe, _ = _unix_socket_probe(tmp_path)
     unit = "helixweave-api.service"
@@ -1741,7 +1861,11 @@ def test_docker_proc_enoent_repeats_full_observation_before_persisting(
     assert persisted == [service]
     assert service.main_pid == 123 and service.process_start_ticks == 5678
     assert service.sockets == (SocketWitness("bulk-docker", 41, 84, 4567),)
-    diagnostics = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    diagnostics = [
+        json.loads(line.split(" ", 1)[1])
+        for line in logs
+        if line.startswith("helixweave-service-start ")
+    ]
     assert [(d["phase"], d["code"]) for d in diagnostics] == [
         ("systemctl", "OK"),
         ("observe", "OK"),
@@ -1823,7 +1947,11 @@ def test_docker_proc_scan_failure_is_narrow_and_process_bound(
         if failure in {"deadline", "exit"}
         else "OPERATOR_SERVICE_OBSERVE_FAILED"
     )
-    assert [json.loads(s.split(" ", 1)[1])["phase"] for s in logs] == [
+    assert [
+        json.loads(s.split(" ", 1)[1])["phase"]
+        for s in logs
+        if s.startswith("helixweave-service-start ")
+    ] == [
         "systemctl",
         "observe",
     ]

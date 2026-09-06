@@ -149,6 +149,32 @@ SERVICE_SOCKET_NAMES: dict[str, tuple[str, ...]] = {
     "helixweave-docker-rootless.service": ("bulk-docker",),
 }
 
+
+def _observation_diagnostic(
+    phase: str,
+    code: str,
+    *,
+    unit: str | None = None,
+    task: str | None = None,
+    differing_fields: tuple[str, ...] = (),
+) -> None:
+    """Small local breadcrumbs, separate from public receipts and raw errors."""
+    record: dict[str, object] = {"phase": phase, "code": code}
+    if unit in SERVICE_UNITS:
+        record["unit"] = unit
+    if task is not None and _valid_task_identity(task):
+        record["task_identity"] = task
+    if differing_fields:
+        record["differing_fields"] = differing_fields
+    try:
+        syslog.syslog(
+            syslog.LOG_INFO,
+            "helixweave-observation " + canonical_json_bytes(record).decode().strip(),
+        )
+    except OSError:
+        pass  # A local logging failure cannot change the observation outcome.
+
+
 SYSTEMCTL = Path("/usr/bin/systemctl")
 SAFE_ENVIRONMENT = {
     "LANG": "C.UTF-8",
@@ -1687,6 +1713,7 @@ class LinuxServiceProbe:
             kernel_inode = self._listening_unix_socket_inode(
                 path,
                 allow_socket_pending=allow_socket_pending,
+                unit=unit,
             )
             pids_before = self._cgroup_pids(cgroup)
             if main_pid not in pids_before:
@@ -1786,13 +1813,16 @@ class LinuxServiceProbe:
         socket_path: Path,
         *,
         allow_socket_pending: bool = False,
+        unit: str | None = None,
     ) -> int:
+        reason = "UNIX_TABLE_UNAVAILABLE"
         try:
             content = _read_bounded_path(
                 self.proc_root / "net/unix",
                 self._MAX_PROC_NET_UNIX_BYTES,
             )
             lines = content.splitlines()
+            reason = "UNIX_TABLE_INVALID"
             if not lines or len(lines) > self._MAX_PROC_NET_UNIX_LINES:
                 raise OSError
             rendered_path = str(socket_path)
@@ -1801,22 +1831,32 @@ class LinuxServiceProbe:
                 fields = raw_line.decode("utf-8").split(maxsplit=7)
                 if len(fields) != 8 or fields[7] != rendered_path:
                     continue
+                reason = "UNIX_SOCKET_ROW_INVALID"
                 flags = int(fields[3], 16)
                 kernel_inode = int(fields[6], 10)
+                if not 0 < kernel_inode <= 2**63 - 1:
+                    raise OSError
+                # Accepted stream connections retain the listener's pathname
+                # in /proc/net/unix. They are not competing listener identities.
+                if fields[4] == "0001" and fields[5] == "03" and flags == 0:
+                    continue
                 if (
                     fields[4] != "0001"
                     or fields[5] != "01"
                     or not flags & self._SO_ACCEPTCON
-                    or not 0 < kernel_inode <= 2**63 - 1
                 ):
                     raise OSError
                 matches.append(kernel_inode)
             if not matches and allow_socket_pending:
+                _observation_diagnostic("unix-listener", "LISTENER_PENDING", unit=unit)
                 raise _ServiceReadinessPending
+            reason = "LISTENER_MISSING" if not matches else "LISTENER_AMBIGUOUS"
             if len(matches) != 1:
                 raise OSError
+            _observation_diagnostic("unix-listener", "OK", unit=unit)
             return matches[0]
         except (OSError, UnicodeError, ValueError):
+            _observation_diagnostic("unix-listener", reason, unit=unit)
             raise OSError from None
 
     def _cgroup_pids(self, cgroup: str) -> frozenset[int]:
@@ -2143,31 +2183,81 @@ class SystemdServiceController:
 
     def status(self, request: OperatorRequest) -> ServiceIdentity | None:
         assert request.unit is not None
-        prior = self._read_identity(request.unit, required=False)
+        try:
+            prior = self._read_identity(request.unit, required=False)
+        except DeploymentError:
+            _observation_diagnostic(
+                "service-identity-read",
+                "IDENTITY_UNAVAILABLE",
+                unit=request.unit,
+                task=request.task_identity,
+            )
+            raise
         task = request.task_identity if prior is None else prior.task_identity
-        service = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=task,
-        )
+        try:
+            service = self.probe.observe(
+                unit=request.unit,
+                deployment_identity=request.deployment_identity,
+                task_identity=task,
+            )
+        except Exception:
+            _observation_diagnostic(
+                "service-observe",
+                "OBSERVATION_FAILED",
+                unit=request.unit,
+                task=request.task_identity,
+            )
+            raise
         if service is None:
+            _observation_diagnostic(
+                "service-identity",
+                "STOPPED",
+                unit=request.unit,
+                task=request.task_identity,
+            )
             return None
         if prior is None:
+            _observation_diagnostic(
+                "service-identity",
+                "IDENTITY_MISSING",
+                unit=request.unit,
+                task=request.task_identity,
+            )
             raise fail(
                 "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE",
                 "Running service has no trusted operator identity.",
             )
         if prior.deployment_identity != request.deployment_identity:
+            _observation_diagnostic(
+                "service-identity",
+                "DEPLOYMENT_MISMATCH",
+                unit=request.unit,
+                task=request.task_identity,
+                differing_fields=("deployment_identity",),
+            )
             raise fail(
                 "OPERATOR_SERVICE_IDENTITY_MISMATCH",
                 "Service identity does not match this deployment.",
             )
         if service.identity != prior.identity:
+            expected, observed = prior.to_dict(), service.to_dict()
+            _observation_diagnostic(
+                "service-identity",
+                "IDENTITY_MISMATCH",
+                unit=request.unit,
+                task=request.task_identity,
+                differing_fields=tuple(
+                    sorted(k for k in expected if expected[k] != observed[k])
+                ),
+            )
             raise fail(
                 "OPERATOR_SERVICE_IDENTITY_MISMATCH",
                 "Service identity changed before the requested action.",
                 recoverable=True,
             )
+        _observation_diagnostic(
+            "service-identity", "OK", unit=request.unit, task=request.task_identity
+        )
         return service
 
     @staticmethod

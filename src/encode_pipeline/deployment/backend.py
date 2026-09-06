@@ -56,6 +56,7 @@ from encode_pipeline.deployment.operator import (
     SERVICE_UNITS,
     OperatorObservation,
     ServiceIdentity,
+    _observation_diagnostic,
 )
 from encode_pipeline.deployment.operator_action import DeploymentActionReceipt
 
@@ -209,13 +210,21 @@ class SudoOperatorClient(DeploymentOperatorClient):
             or receipt.get("task_identity") != task
             or receipt.get("deployment_identity") != state_identity
         ):
+            _observation_diagnostic("operator-receipt", "ENVELOPE_MISMATCH", task=task)
             raise _operator_failure()
         try:
             observation = OperatorObservation.from_dict(receipt.get("observation"))
         except DeploymentError:
+            _observation_diagnostic(
+                "operator-receipt", "OBSERVATION_INVALID", task=task
+            )
             raise _operator_failure() from None
         if observation.state_identity != state_identity:
+            _observation_diagnostic(
+                "operator-receipt", "STATE_IDENTITY_MISMATCH", task=task
+            )
             raise _operator_failure()
+        _observation_diagnostic("operator-receipt", "OK", task=task)
         return observation
 
     def verify(self, state_identity: str, task: str) -> DeploymentActionReceipt:
@@ -275,17 +284,32 @@ class SudoOperatorClient(DeploymentOperatorClient):
             raise _operator_failure()
 
     def _invoke(self, arguments: tuple[str, ...]) -> Mapping[str, object]:
+        task = arguments[-1]
         try:
             completed = self._runner(arguments)
         except Exception:
+            _observation_diagnostic(
+                "operator-execute", "EXECUTION_EXCEPTION", task=task
+            )
             raise _operator_failure(recoverable=True) from None
         if not isinstance(completed, OperatorExecution):
+            _observation_diagnostic(
+                "operator-execute", "EXECUTION_TYPE_INVALID", task=task
+            )
             raise _operator_failure()
         if (
             completed.returncode != 0
             or completed.stderr
             or not 0 < len(completed.stdout) <= _MAX_OPERATOR_RECEIPT_BYTES
         ):
+            code = (
+                "EXIT_NONZERO"
+                if completed.returncode != 0
+                else "STDERR_PRESENT"
+                if completed.stderr
+                else "RECEIPT_SIZE_INVALID"
+            )
+            _observation_diagnostic("operator-execute", code, task=task)
             raise _operator_failure(recoverable=completed.returncode in {69, 77})
         try:
             document = json.loads(
@@ -294,6 +318,7 @@ class SudoOperatorClient(DeploymentOperatorClient):
                 parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
             )
         except (UnicodeError, ValueError, json.JSONDecodeError):
+            _observation_diagnostic("operator-parse", "JSON_INVALID", task=task)
             raise _operator_failure() from None
         if (
             not isinstance(document, dict)
@@ -302,7 +327,11 @@ class SudoOperatorClient(DeploymentOperatorClient):
             != json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
             + b"\n"
         ):
+            _observation_diagnostic(
+                "operator-parse", "CANONICAL_RECEIPT_INVALID", task=task
+            )
             raise _operator_failure()
+        _observation_diagnostic("operator-parse", "OK", task=task)
         return document
 
 
@@ -811,9 +840,14 @@ class ProductionCommandBackend:
         self,
         status: DeploymentStatus,
     ) -> OperatorObservation | None:
+        task = None
         try:
-            observation = self.operator.observe(status.state.identity, self._task())
+            task = self._task()
+            observation = self.operator.observe(status.state.identity, task)
         except Exception:
+            _observation_diagnostic(
+                "state-binding", "OBSERVATION_UNAVAILABLE", task=task
+            )
             return None
         active = {
             component: status.state.components[component].active
@@ -823,7 +857,24 @@ class ProductionCommandBackend:
             observation.state_identity != status.state.identity
             or observation.active != active
         ):
+            _observation_diagnostic(
+                "state-binding",
+                "BINDING_MISMATCH",
+                task=task,
+                differing_fields=tuple(
+                    name
+                    for name, differs in (
+                        (
+                            "state_identity",
+                            observation.state_identity != status.state.identity,
+                        ),
+                        ("active", observation.active != active),
+                    )
+                    if differs
+                ),
+            )
             return None
+        _observation_diagnostic("state-binding", "OK", task=task)
         return observation
 
     def _operator_verification(
