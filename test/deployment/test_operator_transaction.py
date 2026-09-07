@@ -5,6 +5,10 @@ import os
 from pathlib import Path
 
 import pytest
+from dataclasses import replace
+import errno
+
+from encode_pipeline.deployment import operator_transaction as transaction_module
 
 from encode_pipeline.deployment.errors import DeploymentError
 from encode_pipeline.deployment.backend import _deployment_state_probe
@@ -61,6 +65,72 @@ def test_terminal_journal_moves_from_single_active_pointer_to_history(
     )
     assert archived["phase"] == "complete"
     assert store.summary().pending_count == 0
+
+
+@pytest.mark.parametrize(
+    "phase", ["recovery-result-validation", "terminal-write", "archive"]
+)
+def test_recovery_finalize_diagnostic_preserves_original_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    layout, store = _store(tmp_path)
+    directory, history = store._directories(create=True)
+    record = OperatorTransaction.create(
+        request_identity=IDENTITY,
+        operation="start",
+        task_identity=TASK,
+        deployment_identity=IDENTITY,
+        component=None,
+        unit="helixweave-api.service",
+        phase="recovery-required",
+        failure_phase="service-starting",
+        point_of_no_return=True,
+        restart_units=("helixweave-api.service",),
+    )
+    store._write_new(layout.operator_transaction_active, record)
+
+    class Recovery:
+        def recover(self, active):
+            assert active == record
+            value = replace(active, phase="complete").to_dict()
+            value.pop("schema_version")
+            value.pop("identity")
+            return OperatorTransaction.create(**value)
+
+    store.recovery_controller = Recovery()
+    logs = []
+    monkeypatch.setattr(
+        transaction_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    error = OSError(errno.EIO, "private path secret=value")
+
+    def broken(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        store,
+        {
+            "recovery-result-validation": "_validate_recovery_result",
+            "terminal-write": "_replace_active",
+            "archive": "_archive_and_clear",
+        }[phase],
+        broken,
+    )
+    with pytest.raises(OSError) as caught:
+        store._reconcile_active(directory, history)
+    assert caught.value is error
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    failures = [r for r in records if r["status"] == "failure"]
+    assert [(r["phase"], r["error_type"], r["errno"]) for r in failures] == [
+        (phase, "OSError", errno.EIO)
+    ]
+    assert failures[0]["task_identity"] == TASK
+    assert failures[0]["unit"] == record.unit
+    assert "private" not in "".join(logs) and "secret" not in "".join(logs)
+    current = store._read(layout.operator_transaction_active)
+    assert current.point_of_no_return
+    assert current.phase == ("complete" if phase == "archive" else "recovery-required")
+    assert not (history / f"{TASK}.json").exists()
 
 
 def test_pre_side_effect_failure_is_durably_aborted_and_does_not_block_retry(

@@ -862,13 +862,44 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
         ("start", unit),
         ("stop", unit),
     ]
-    if unit == "helixweave-docker-rootless.service":
-        diagnostics = [json.loads(line.split(" ", 1)[1]) for line in logs]
-        assert [(d["phase"], d["code"]) for d in diagnostics] == [
-            ("systemctl", "OK"),
-            ("observe", "OK"),
-            ("persist", "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"),
-        ]
+    diagnostics = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    failures = [d for d in diagnostics if d["status"] == "failure"]
+    assert [(d["phase"], d["code"]) for d in failures] == [
+        ("identity-persist", "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"),
+    ]
+    assert all(d["unit"] == unit for d in diagnostics)
+    assert all(d["task_identity"] == TASK_IDENTITY for d in diagnostics)
+    assert diagnostics[-1]["phase"] == "persist-cleanup-observe"
+    assert diagnostics[-1]["status"] == "success"
+
+
+def test_persist_and_cleanup_failures_are_logged_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    service = _worker_service_identity()
+    controller = SystemdServiceController(DeploymentLayout.isolated(tmp_path))
+
+    def broken_write(_service):
+        raise fail("OPERATOR_SERVICE_IDENTITY_UNAVAILABLE", "private write details")
+
+    def broken_stop(*_args):
+        raise fail("OPERATOR_SYSTEMCTL_FAILED", "private stop details")
+
+    monkeypatch.setattr(controller, "_write_identity", broken_write)
+    monkeypatch.setattr(controller.systemctl, "control", broken_stop)
+    with pytest.raises(DeploymentError) as caught:
+        controller._persist_started_service(service)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_RECOVERY_REQUIRED"
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    assert [(r["phase"], r["code"]) for r in records if r["status"] == "failure"] == [
+        ("identity-persist", "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"),
+        ("persist-cleanup-stop", "OPERATOR_SYSTEMCTL_FAILED"),
+    ]
+    assert "private" not in "".join(logs)
 
 
 def test_rootless_docker_start_waits_for_full_service_identity(
@@ -1430,10 +1461,18 @@ def test_bootstrap_repairs_a_post_commit_partial_uninstall_without_journal_deadl
     "error",
     [
         RuntimeError("/private/reference secret=value"),
+        PermissionError(errno.EACCES, "/private/reference secret=value"),
         fail("BACKEND_PRIVATE", "/private/reference secret=value"),
     ],
 )
-def test_backend_errors_are_replaced_by_one_redacted_failure(error: Exception) -> None:
+def test_backend_errors_are_replaced_by_one_redacted_failure(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+
     class FailingBackend:
         def execute(self, request, *, bundle_path):
             del request, bundle_path
@@ -1449,6 +1488,27 @@ def test_backend_errors_are_replaced_by_one_redacted_failure(error: Exception) -
     assert caught.value.issue.message == "Operator action failed."
     assert "private" not in str(caught.value)
     assert "secret" not in str(caught.value)
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    diagnostic = records[-1]
+    assert diagnostic["phase"] == "operator-execute"
+    assert diagnostic["status"] == "failure"
+    assert diagnostic["error_type"] == type(error).__name__
+    assert diagnostic["task_identity"] == TASK_IDENTITY
+    if isinstance(error, DeploymentError):
+        assert diagnostic["code"] == error.issue.code
+    elif isinstance(error, OSError):
+        assert diagnostic["errno"] == errno.EACCES
+    assert "private" not in "".join(logs) and "secret" not in "".join(logs)
+
+    def broken_log(*_args):
+        raise RuntimeError("logging unavailable")
+
+    monkeypatch.setattr(operator_module.syslog, "syslog", broken_log)
+    with pytest.raises(DeploymentError) as again:
+        execute_request(
+            ("stage", "platform", IDENTITY, TASK_IDENTITY), backend=FailingBackend()
+        )
+    assert again.value.issue == caught.value.issue
 
 
 def test_start_receipt_binds_task_process_executable_cmdline_and_socket_contract() -> (
@@ -1785,6 +1845,37 @@ def _api_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return controller, probe, request, values
 
 
+def test_api_observe_failure_is_distinct_from_persist_and_public_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, probe, request, _values = _api_start_probe(tmp_path, monkeypatch)
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    error = fail("OPERATOR_SERVICE_OBSERVE_FAILED", "private detail")
+
+    def observe(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(probe, "observe_starting", observe)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persist called")
+    )
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value is error
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    failures = [r for r in records if r.get("status") == "failure"]
+    assert [(r["phase"], r["code"]) for r in failures] == [
+        ("strong-observe", "OPERATOR_SERVICE_OBSERVE_FAILED")
+    ]
+    assert failures[0]["unit"] == request.unit
+    assert failures[0]["task_identity"] == request.task_identity
+    assert not any(r["phase"].startswith("identity-persist") for r in records)
+    assert "private" not in "".join(logs)
+
+
 def test_api_start_waits_for_same_invocation_then_persists_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1864,12 +1955,15 @@ def test_docker_proc_enoent_repeats_full_observation_before_persisting(
     diagnostics = [
         json.loads(line.split(" ", 1)[1])
         for line in logs
-        if line.startswith("helixweave-service-start ")
+        if line.startswith("helixweave-operator-phase ")
     ]
-    assert [(d["phase"], d["code"]) for d in diagnostics] == [
-        ("systemctl", "OK"),
-        ("observe", "OK"),
-        ("persist", "OK"),
+    assert [
+        (d["phase"], d["status"]) for d in diagnostics if d["status"] != "begin"
+    ] == [
+        ("start-preflight-observe", "success"),
+        ("systemctl-start", "success"),
+        ("strong-observe", "success"),
+        ("identity-persist", "success"),
     ]
     assert "private" not in "".join(logs)
 
@@ -1950,10 +2044,12 @@ def test_docker_proc_scan_failure_is_narrow_and_process_bound(
     assert [
         json.loads(s.split(" ", 1)[1])["phase"]
         for s in logs
-        if s.startswith("helixweave-service-start ")
+        if s.startswith("helixweave-operator-phase ")
+        and json.loads(s.split(" ", 1)[1])["status"] != "begin"
     ] == [
-        "systemctl",
-        "observe",
+        "start-preflight-observe",
+        "systemctl-start",
+        "strong-observe",
     ]
     if failure == "deadline":
         assert now[0] == pytest.approx(15.0)

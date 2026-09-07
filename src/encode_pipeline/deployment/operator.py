@@ -8,7 +8,6 @@ path derivation, and public receipts can be tested without systemd or root.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -62,6 +61,7 @@ from encode_pipeline.deployment.models import (
     DeploymentState,
 )
 from encode_pipeline.deployment.operator_transaction import (
+    _operator_phase,
     OperatorJournalHandle,
     OperatorJournalStore,
     OperatorJournalSummary,
@@ -1999,11 +1999,12 @@ class SystemdServiceController:
 
     def start(self, request: OperatorRequest) -> ServiceIdentity:
         assert request.unit is not None
-        existing = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=request.task_identity,
-        )
+        with _operator_phase("start-preflight-observe", request):
+            existing = self.probe.observe(
+                unit=request.unit,
+                deployment_identity=request.deployment_identity,
+                task_identity=request.task_identity,
+            )
         if existing is not None:
             raise fail(
                 "OPERATOR_SERVICE_ALREADY_RUNNING", "Service is already running."
@@ -2013,9 +2014,9 @@ class SystemdServiceController:
             if request.unit in _READINESS_UNITS
             else None
         )
-        with self._docker_start_phase(request.unit, "systemctl"):
+        with _operator_phase("systemctl-start", request):
             self.systemctl.control("start", request.unit)
-        with self._docker_start_phase(request.unit, "observe"):
+        with _operator_phase("strong-observe", request):
             service = self._observe_started_service(
                 request,
                 readiness_deadline=readiness_deadline,
@@ -2026,46 +2027,8 @@ class SystemdServiceController:
                     "Service did not enter the running state.",
                     recoverable=True,
                 )
-        with self._docker_start_phase(request.unit, "persist"):
-            self._persist_started_service(service)
+        self._persist_started_service(service)
         return service
-
-    @contextmanager
-    def _docker_start_phase(self, unit: str, phase: str):
-        """Retain bounded, path-free local diagnostics; never alter receipts."""
-        if unit != "helixweave-docker-rootless.service":
-            yield
-            return
-        started = time.monotonic()
-        code = "OK"
-        try:
-            yield
-        except Exception as error:
-            code = (
-                error.issue.code
-                if isinstance(error, DeploymentError)
-                else "UNEXPECTED_FAILURE"
-            )
-            raise
-        finally:
-            try:
-                syslog.syslog(
-                    syslog.LOG_INFO,
-                    "helixweave-service-start "
-                    + canonical_json_bytes(
-                        {
-                            "phase": phase,
-                            "code": code,
-                            "elapsed_ms": max(
-                                0, int((time.monotonic() - started) * 1000)
-                            ),
-                        }
-                    )
-                    .decode()
-                    .strip(),
-                )
-            except OSError:
-                pass  # Logging cannot change the native operation result.
 
     def _observe_started_service(
         self,
@@ -2164,18 +2127,19 @@ class SystemdServiceController:
     def recover_observe(self, request: OperatorRequest) -> ServiceIdentity | None:
         """Adopt a running service only under an authoritative recovery journal."""
         assert request.unit is not None
-        service = (
-            self._observe_started_service(
-                request,
-                readiness_deadline=time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS,
+        with _operator_phase("recovery-service-observe", request):
+            service = (
+                self._observe_started_service(
+                    request,
+                    readiness_deadline=time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS,
+                )
+                if request.unit == "helixweave-worker.service"
+                else self.probe.observe(
+                    unit=request.unit,
+                    deployment_identity=request.deployment_identity,
+                    task_identity=request.task_identity,
+                )
             )
-            if request.unit == "helixweave-worker.service"
-            else self.probe.observe(
-                unit=request.unit,
-                deployment_identity=request.deployment_identity,
-                task_identity=request.task_identity,
-            )
-        )
         if service is None:
             return None
         self._persist_started_service(service)
@@ -2473,15 +2437,18 @@ class SystemdServiceController:
 
     def _persist_started_service(self, service: ServiceIdentity) -> None:
         try:
-            self._write_identity(service)
+            with _operator_phase("identity-persist", service):
+                self._write_identity(service)
         except DeploymentError:
             try:
-                self.systemctl.control("stop", service.unit)
-                stopped = self.probe.observe(
-                    unit=service.unit,
-                    deployment_identity=service.deployment_identity,
-                    task_identity=service.task_identity,
-                )
+                with _operator_phase("persist-cleanup-stop", service):
+                    self.systemctl.control("stop", service.unit)
+                with _operator_phase("persist-cleanup-observe", service):
+                    stopped = self.probe.observe(
+                        unit=service.unit,
+                        deployment_identity=service.deployment_identity,
+                        task_identity=service.task_identity,
+                    )
             except DeploymentError:
                 raise fail(
                     "OPERATOR_SERVICE_RECOVERY_REQUIRED",
@@ -3669,55 +3636,57 @@ class HostDeploymentActionController:
         self,
         record: OperatorTransaction,
     ) -> OperatorTransaction:
-        if (
-            record.component is not None
-            or record.prior_state_identity is None
-            or record.candidate_state_identity != record.prior_state_identity
-            or record.prior_active is None
-            or record.candidate_active != record.prior_active
-            or (record.operation == UNINSTALL) != (record.unit is None)
-            or (record.operation != UNINSTALL) != (record.unit is not None)
-            or (
-                record.operation == UNINSTALL
-                and (
-                    record.deployment_identity != record.prior_state_identity
-                    or record.restart_units != record.prior_running_units
-                )
-            )
-            or (
-                record.operation != UNINSTALL and record.restart_units != (record.unit,)
-            )
-            or (record.operation == START and record.prior_running_units)
-            or (
-                record.operation in {STOP, CLEANUP}
-                and record.prior_running_units != (record.unit,)
-            )
-        ):
-            raise fail(
-                "OPERATOR_RECOVERY_REQUIRED",
-                "Operator transaction requires recovery.",
-                recoverable=True,
-            )
-        with self.states.transaction(
-            exclusive=False,
-            expected_owner_uid=self.root_uid,
-            expected_owner_gid=self.root_gid,
-        ) as transaction:
-            state = transaction.read()
+        with _operator_phase("recovery-candidate-preflight", record):
             if (
-                transaction.pending_transactions()
-                or state.identity != record.prior_state_identity
-                or {
-                    component: state.components[component].active
-                    for component in COMPONENTS
-                }
-                != record.prior_active
+                record.component is not None
+                or record.prior_state_identity is None
+                or record.candidate_state_identity != record.prior_state_identity
+                or record.prior_active is None
+                or record.candidate_active != record.prior_active
+                or (record.operation == UNINSTALL) != (record.unit is None)
+                or (record.operation != UNINSTALL) != (record.unit is not None)
+                or (
+                    record.operation == UNINSTALL
+                    and (
+                        record.deployment_identity != record.prior_state_identity
+                        or record.restart_units != record.prior_running_units
+                    )
+                )
+                or (
+                    record.operation != UNINSTALL
+                    and record.restart_units != (record.unit,)
+                )
+                or (record.operation == START and record.prior_running_units)
+                or (
+                    record.operation in {STOP, CLEANUP}
+                    and record.prior_running_units != (record.unit,)
+                )
             ):
                 raise fail(
                     "OPERATOR_RECOVERY_REQUIRED",
                     "Operator transaction requires recovery.",
                     recoverable=True,
                 )
+            with self.states.transaction(
+                exclusive=False,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            ) as transaction:
+                state = transaction.read()
+                if (
+                    transaction.pending_transactions()
+                    or state.identity != record.prior_state_identity
+                    or {
+                        component: state.components[component].active
+                        for component in COMPONENTS
+                    }
+                    != record.prior_active
+                ):
+                    raise fail(
+                        "OPERATOR_RECOVERY_REQUIRED",
+                        "Operator transaction requires recovery.",
+                        recoverable=True,
+                    )
         if record.operation == UNINSTALL:
             self._recover_uninstall(record)
             return _terminal_recovery_record(record, phase="aborted")
@@ -3877,39 +3846,41 @@ class HostDeploymentActionController:
 
     def _resume_candidate(self, record: OperatorTransaction) -> None:
         assert record.candidate_active is not None
-        self.states.recover_pending_transaction(
-            prior_state_identity=record.prior_state_identity,
-            candidate_state_identity=record.candidate_state_identity,
-            desired="complete-candidate",
-            expected_owner_uid=self.root_uid,
-            expected_owner_gid=self.root_gid,
-        )
-        if not self._database_exists():
-            raise fail(
-                "OPERATOR_RECOVERY_REQUIRED",
-                "Operator transaction requires recovery.",
-                recoverable=True,
+        with _operator_phase("recovery-state-selection", record):
+            self.states.recover_pending_transaction(
+                prior_state_identity=record.prior_state_identity,
+                candidate_state_identity=record.candidate_state_identity,
+                desired="complete-candidate",
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
             )
-        assert self.service_uid is not None
-        assert self.service_gid is not None
-        database = inspect_database(
-            self.layout.database,
-            expected_owner_uid=self.service_uid,
-            expected_owner_gid=self.service_gid,
-        )
-        expected_database_identity = (
-            record.schema_after_identity or record.source_database_identity
-        )
-        if (
-            expected_database_identity is None
-            or database_content_identity(database) != expected_database_identity
-            or database.schema_heads != record.target_schema_heads
-        ):
-            raise fail(
-                "OPERATOR_RECOVERY_REQUIRED",
-                "Operator transaction requires recovery.",
-                recoverable=True,
+        with _operator_phase("recovery-database-preflight", record):
+            if not self._database_exists():
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Operator transaction requires recovery.",
+                    recoverable=True,
+                )
+            assert self.service_uid is not None
+            assert self.service_gid is not None
+            database = inspect_database(
+                self.layout.database,
+                expected_owner_uid=self.service_uid,
+                expected_owner_gid=self.service_gid,
             )
+            expected_database_identity = (
+                record.schema_after_identity or record.source_database_identity
+            )
+            if (
+                expected_database_identity is None
+                or database_content_identity(database) != expected_database_identity
+                or database.schema_heads != record.target_schema_heads
+            ):
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Operator transaction requires recovery.",
+                    recoverable=True,
+                )
         self._recover_retained_redis(record, restore=False)
         for unit in record.restart_units:
             deployment = self._service_deployment(record.candidate_active, unit)
@@ -5977,7 +5948,8 @@ def execute_request(
         else None
     )
     try:
-        outcome = backend.execute(request, bundle_path=bundle_path)
+        with _operator_phase("operator-execute", request):
+            outcome = backend.execute(request, bundle_path=bundle_path)
     except DeploymentError as error:
         raise fail(
             "OPERATOR_OPERATION_FAILED",
