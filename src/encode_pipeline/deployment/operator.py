@@ -1316,12 +1316,12 @@ class _ServiceReadinessPending(Exception):
     def __init__(
         self,
         api_process: tuple[int, int, str, str] | None = None,
-        worker_stages: tuple[int, int] | None = None,
+        entry_stages: tuple[int, int] | None = None,
         docker_stages: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.api_process = api_process
-        self.worker_stages = worker_stages
+        self.entry_stages = entry_stages
         self.docker_stages = docker_stages
 
 
@@ -1733,9 +1733,14 @@ class LinuxServiceProbe:
                 "Service status could not be observed.",
             )
         try:
-            worker_forms = (
-                self._worker_launch_forms(deployment_identity)
-                if allow_socket_pending and unit == "helixweave-worker.service"
+            entry_forms = (
+                (
+                    self._worker_launch_forms(deployment_identity)
+                    if unit == "helixweave-worker.service"
+                    else self._candidate_launch_forms(deployment_identity, "api")
+                )
+                if allow_socket_pending
+                and unit in {"helixweave-api.service", "helixweave-worker.service"}
                 else None
             )
             docker_forms = (
@@ -1751,7 +1756,7 @@ class LinuxServiceProbe:
             executable = (process / "exe").stat()
             cmdline = (process / "cmdline").read_bytes()
             boot = (self.proc_root / "sys/kernel/random/boot_id").read_bytes()
-            if worker_forms is not None or docker_forms is not None:
+            if entry_forms is not None or docker_forms is not None:
                 worker_status = (process / "status").read_bytes()
         except (OSError, ValueError, IndexError, StableBoundaryError):
             raise fail(
@@ -1798,15 +1803,26 @@ class LinuxServiceProbe:
             final_start_ticks = int(final_fields[19])
             final_executable = (process / "exe").stat()
             final_cmdline = (process / "cmdline").read_bytes()
-            if worker_forms is not None or docker_forms is not None:
+            if entry_forms is not None or docker_forms is not None:
                 final_worker_status = (process / "status").read_bytes()
-                account = pwd.getpwnam("helixweave")
+                account = pwd.getpwnam(
+                    "helixweave-api"
+                    if unit == "helixweave-api.service"
+                    else "helixweave"
+                )
+                # The API unit overrides its account's primary group with the
+                # shared runtime group; derive the witness from that contract.
+                gid = (
+                    grp.getgrnam("helixweave").gr_gid
+                    if unit == "helixweave-api.service"
+                    else account.pw_gid
+                )
                 for raw_status in (worker_status, final_worker_status):
                     fields = dict(
                         line.split(b":", 1) for line in raw_status.splitlines()
                     )
                     if fields[b"Uid"].split() != [str(account.pw_uid).encode()] * 4 or (
-                        fields[b"Gid"].split() != [str(account.pw_gid).encode()] * 4
+                        fields[b"Gid"].split() != [str(gid).encode()] * 4
                     ):
                         raise OSError
                 if main_pid not in self._cgroup_pids(expected_cgroup):
@@ -1821,7 +1837,7 @@ class LinuxServiceProbe:
             or final_values != values
             or final_start_ticks != start_ticks
             or (
-                worker_forms is None
+                entry_forms is None
                 and docker_forms is None
                 and (
                     _file_witness(final_executable) != _file_witness(executable)
@@ -1900,7 +1916,7 @@ class LinuxServiceProbe:
                     ),
                     docker_stages=(stages[0], stages[1]),
                 )
-        if worker_forms is not None:
+        if entry_forms is not None:
             stages = []
             for command, binary in (
                 (cmdline, executable),
@@ -1910,7 +1926,7 @@ class LinuxServiceProbe:
                     (
                         i
                         for i, (expected_command, expected_binary) in enumerate(
-                            worker_forms
+                            entry_forms
                         )
                         if command == expected_command
                         and _file_witness(binary) == _file_witness(expected_binary)
@@ -1918,6 +1934,21 @@ class LinuxServiceProbe:
                     None,
                 )
                 if stage is None or (stages and stage < stages[-1]):
+                    self._stability_diagnostic(
+                        unit=unit,
+                        deployment_identity=deployment_identity,
+                        task_identity=task_identity,
+                        values=values,
+                        final_values=final_values,
+                        closing=closing,
+                        final_closing=final_closing,
+                        start_ticks=start_ticks,
+                        final_start_ticks=final_start_ticks,
+                        executable=executable,
+                        final_executable=final_executable,
+                        cmdline=cmdline,
+                        final_cmdline=final_cmdline,
+                    )
                     raise fail(
                         "OPERATOR_SERVICE_OBSERVE_FAILED",
                         "Service status could not be observed.",
@@ -1933,7 +1964,7 @@ class LinuxServiceProbe:
                         _bytes_identity(values["InvocationID"].encode()),
                         _bytes_identity(boot.strip()),
                     ),
-                    worker_stages=(stages[0], stages[1]),
+                    entry_stages=(stages[0], stages[1]),
                 )
         if sockets is None:
             pending_type = (
@@ -1947,6 +1978,7 @@ class LinuxServiceProbe:
                     _bytes_identity(boot.strip()),
                 ),
                 docker_stages=(1, 1) if docker_forms is not None else None,
+                entry_stages=(2, 2) if entry_forms is not None else None,
             )
         return ServiceIdentity.create(
             unit=unit,
@@ -2346,7 +2378,7 @@ class SystemdServiceController:
         observer = getattr(self.probe, "observe_starting", self.probe.observe)
         assert readiness_deadline is not None
         api_process = None
-        worker_stage = -1
+        entry_stage = -1
         docker_stage = -1
         while True:
             if time.monotonic() >= readiness_deadline:
@@ -2375,15 +2407,18 @@ class SystemdServiceController:
                             "Service status could not be observed.",
                         ) from None
                     api_process = pending.api_process
-                if request.unit == "helixweave-worker.service":
-                    if pending.worker_stages is None or (
-                        pending.worker_stages[0] < worker_stage
+                if request.unit in {
+                    "helixweave-api.service",
+                    "helixweave-worker.service",
+                }:
+                    if pending.entry_stages is None or (
+                        pending.entry_stages[0] < entry_stage
                     ):
                         raise fail(
                             "OPERATOR_SERVICE_OBSERVE_FAILED",
                             "Service status could not be observed.",
                         ) from None
-                    worker_stage = pending.worker_stages[1]
+                    entry_stage = pending.entry_stages[1]
                 if (
                     request.unit == "helixweave-docker-rootless.service"
                     and pending.docker_stages is not None
@@ -2444,7 +2479,8 @@ class SystemdServiceController:
                     request,
                     readiness_deadline=time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS,
                 )
-                if request.unit == "helixweave-worker.service"
+                if request.unit
+                in {"helixweave-api.service", "helixweave-worker.service"}
                 else self.probe.observe(
                     unit=request.unit,
                     deployment_identity=request.deployment_identity,

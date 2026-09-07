@@ -985,7 +985,7 @@ def test_socket_service_start_readiness_wait_is_bounded(
         def observe_starting(self, **_kwargs):
             self.starting_calls += 1
             raise operator_module._ServiceReadinessPending(
-                (123, 456, IDENTITY, IDENTITY), worker_stages=(0, 0)
+                (123, 456, IDENTITY, IDENTITY), entry_stages=(0, 0)
             )
 
     class RecordingSystemctl:
@@ -1804,6 +1804,30 @@ def _api_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (process / "stat").write_bytes(b"123 (python) " + b"0 " * 19 + b"5678\n")
     (process / "cmdline").write_bytes(b"python\x00-m\x00encode_pipeline\x00api\x00")
     (process / "exe").symlink_to(Path(sys.executable).resolve())
+    (process / "status").write_text("Uid:\t997 997 997 997\nGid:\t456 456 456 456\n")
+    monkeypatch.setattr(
+        operator_module.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=997, pw_gid=987),
+    )
+    monkeypatch.setattr(
+        operator_module.grp, "getgrnam", lambda _name: SimpleNamespace(gr_gid=456)
+    )
+    forms = tuple(
+        (command, (process / "exe").stat())
+        for command in (
+            b"verified-api-dispatcher\0",
+            b"verified-api-launcher\0",
+            (process / "cmdline").read_bytes(),
+        )
+    )
+    monkeypatch.setattr(
+        probe,
+        "_candidate_launch_forms",
+        lambda identity, command: (
+            forms if identity == IDENTITY and command == "api" else ()
+        ),
+    )
     boot = probe.proc_root / "sys/kernel/random/boot_id"
     boot.parent.mkdir(parents=True)
     boot.write_text("00112233-4455-6677-8899-aabbccddeeff\n")
@@ -1961,7 +1985,13 @@ def test_rejected_observe_diagnoses_the_same_snapshots_without_retry_or_persist(
             (process / "cmdline").write_bytes(b"/private/secret\0")
         return (SocketWitness("api-http", 41, 4567, 4567),)
 
+    candidate_forms = probe._candidate_launch_forms(IDENTITY, "api")
+    form_reads = []
+
     def unavailable_forms(*_args):
+        form_reads.append(True)
+        if len(form_reads) == 1:
+            return candidate_forms
         raise RuntimeError("/private/secret")
 
     monkeypatch.setattr(Path, "stat", captured_stat)
@@ -2474,18 +2504,39 @@ def test_service_argv_is_derived_from_bound_release_launcher(
 
 
 @pytest.mark.parametrize(
-    ("method", "exec_during_observation"),
-    (("start", False), ("start", True), ("recover_observe", False)),
+    ("command_name", "method", "exec_during_observation", "skip_launcher"),
+    (
+        ("worker", "start", False, False),
+        ("worker", "start", True, False),
+        ("worker", "recover_observe", False, False),
+        ("api", "start", True, False),
+        ("api", "start", False, True),
+        ("api", "recover_start", True, False),
+        ("api", "recover_observe", True, False),
+    ),
 )
-def test_worker_start_only_persists_final_verified_entry(
+def test_service_start_only_persists_final_verified_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    command_name: str,
     method: str,
     exec_during_observation: bool,
+    skip_launcher: bool,
 ) -> None:
-    controller, probe, request, values, forms, now = _worker_start_probe(
-        tmp_path, monkeypatch
-    )
+    if command_name == "worker":
+        controller, probe, request, values, forms, now = _worker_start_probe(
+            tmp_path, monkeypatch
+        )
+    else:
+        controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+        forms = probe._candidate_launch_forms(IDENTITY, "api")
+        (probe.proc_root / "123/cmdline").write_bytes(forms[0][0])
+        now = [0.0]
+        monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+        if skip_launcher:
+            (probe.proc_root / "net/tcp").write_text(
+                "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+            )
     if method == "recover_observe":
         values.update(ActiveState="active", SubState="running", MainPID="123")
     persisted = []
@@ -2495,10 +2546,11 @@ def test_worker_start_only_persists_final_verified_entry(
         original = probe._socket_witnesses
 
         def exec_to_launcher(**kwargs):
-            result = original(**kwargs)
-            if command.read_bytes() == forms[0][0]:
-                command.write_bytes(forms[1][0])
-            return result
+            try:
+                return original(**kwargs)
+            finally:
+                if command.read_bytes() == forms[0][0]:
+                    command.write_bytes(forms[1][0])
 
         monkeypatch.setattr(probe, "_socket_witnesses", exec_to_launcher)
 
@@ -2508,7 +2560,13 @@ def test_worker_start_only_persists_final_verified_entry(
         stage = next(
             i for i, form in enumerate(forms) if form[0] == command.read_bytes()
         )
-        command.write_bytes(forms[min(stage + 1, 2)][0])
+        command.write_bytes(forms[2 if skip_launcher else min(stage + 1, 2)][0])
+        if command_name == "api" and stage == 2:
+            # Reaching final argv alone is not readiness: the listener appears
+            # only after another complete observation of the final process.
+            (probe.proc_root / "net/tcp").write_text(
+                "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+            )
 
     monkeypatch.setattr(operator_module.time, "sleep", advance)
     observed = getattr(controller, method)(request)
@@ -2517,6 +2575,51 @@ def test_worker_start_only_persists_final_verified_entry(
         observed.cmdline_identity == "sha256-" + hashlib.sha256(forms[2][0]).hexdigest()
     )
     assert observed.main_pid == 123 and observed.process_start_ticks == 5678
+    if command_name == "api":
+        assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("unknown", "regress-during-observe", "regress-between-observes", "stuck"),
+)
+def test_api_entry_transition_is_not_arbitrary_process_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    controller, probe, request, _values = _api_start_probe(tmp_path, monkeypatch)
+    forms = probe._candidate_launch_forms(IDENTITY, "api")
+    command = probe.proc_root / "123/cmdline"
+    command.write_bytes(b"foreign-candidate\0" if failure == "unknown" else forms[1][0])
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    if failure == "regress-during-observe":
+
+        def regress(**_kwargs):
+            command.write_bytes(forms[0][0])
+            raise operator_module._ServiceReadinessPending()
+
+        monkeypatch.setattr(probe, "_socket_witnesses", regress)
+
+    def advance(delay):
+        assert failure in {"regress-between-observes", "stuck"}, "hard mismatch retried"
+        now[0] += delay
+        if failure == "regress-between-observes":
+            assert now[0] == 0.1, "regression retried"
+            command.write_bytes(forms[0][0])
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if failure == "stuck"
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    if failure == "stuck":
+        assert now[0] == pytest.approx(15.0)
 
 
 @pytest.mark.parametrize(
