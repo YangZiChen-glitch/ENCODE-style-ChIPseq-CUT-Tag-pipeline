@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import socket
 import stat
 import subprocess
@@ -187,6 +188,9 @@ _READINESS_UNITS = (
     "helixweave-docker-rootless.service",
     "helixweave-api.service",
     "helixweave-worker.service",
+)
+_DOCKER_ROOTLESS_SCRIPT_SHA256 = (
+    "904c9b9e35f6927c0a5e65afb4d35b6bc9eb1278c878044501281fc728c9be46"
 )
 # This reader supports the existing, unchanged candidate launcher, including
 # journal-bound older releases. Never infer executable/argv from a live process.
@@ -1313,10 +1317,12 @@ class _ServiceReadinessPending(Exception):
         self,
         api_process: tuple[int, int, str, str] | None = None,
         worker_stages: tuple[int, int] | None = None,
+        docker_stages: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.api_process = api_process
         self.worker_stages = worker_stages
+        self.docker_stages = docker_stages
 
 
 class _ProcScanPending(_ServiceReadinessPending):
@@ -1516,6 +1522,85 @@ class LinuxServiceProbe:
             forms.append((b"\0".join(a.encode() for a in argv) + b"\0", executable))
         return tuple(forms)
 
+    def _docker_launch_forms(
+        self,
+    ) -> tuple[tuple[tuple[bytes, ...], os.stat_result], ...]:
+        """The fixed script execs RootlessKit in MainPID; dockerd is its child.
+
+        Derive argv from the selected shipped unit and the verified Docker
+        29.5.2 script, never from a process being observed. Only the script's
+        automatic network-driver defaults are recognized (no override flags).
+        """
+        verify_stable_operator_boundary()
+        script = Path("/usr/bin/dockerd-rootless.sh")
+        content, observed = read_regular_file(
+            script, max_bytes=64 * 1024, code="OPERATOR_SERVICE_OBSERVE_FAILED"
+        )
+        if (
+            hashlib.sha256(content).hexdigest() != _DOCKER_ROOTLESS_SCRIPT_SHA256
+            or (observed.st_uid, observed.st_gid) != (0, 0)
+            or observed.st_mode & 0o022
+            or not observed.st_mode & 0o111
+        ):
+            raise OSError
+        unit, _ = read_regular_file(
+            Path("/opt/helixweave/operator/current/templates")
+            / "helixweave-docker-rootless.service",
+            max_bytes=64 * 1024,
+            code="OPERATOR_SERVICE_OBSERVE_FAILED",
+        )
+        starts = [
+            line[10:]
+            for line in unit.decode().splitlines()
+            if line.startswith("ExecStart=")
+        ]
+        if len(starts) != 1:
+            raise ValueError
+        argv = tuple(shlex.split(starts[0]))
+        if not argv or argv[0] != str(script):
+            raise ValueError
+
+        def encode(values: tuple[str, ...]) -> bytes:
+            return b"\0".join(v.encode() for v in values) + b"\0"
+
+        # All alternatives below come from the pinned script's default branch.
+        # Do not accept arbitrary args or infer a new supported form from /proc.
+        final = tuple(
+            encode(
+                (
+                    "rootlesskit",
+                    "--state-dir=/run/helixweave/docker/dockerd-rootless",
+                    "--net=" + driver,
+                    "--mtu=" + ("1500" if driver == "vpnkit" else "65520"),
+                    "--slirp4netns-sandbox=auto",
+                    "--slirp4netns-seccomp=auto",
+                    "--disable-host-loopback",
+                    "--port-driver=" + ("implicit" if driver == "pasta" else "builtin"),
+                    "--copy-up=/etc",
+                    "--copy-up=/run",
+                    "--propagation=rslave",
+                    "--detach-netns",
+                    *argv,
+                )
+            )
+            for driver in ("slirp4netns", "pasta", "vpnkit", "gvisor-tap-vsock")
+        )
+        forms = []
+        for commands, executable in (
+            ((encode(("/bin/sh", *argv)),), Path("/bin/sh")),
+            (final, Path("/usr/bin/rootlesskit")),
+        ):
+            witness = executable.stat()
+            if (
+                not stat.S_ISREG(witness.st_mode)
+                or (witness.st_uid, witness.st_gid) != (0, 0)
+                or witness.st_mode & 0o022
+                or not witness.st_mode & 0o111
+            ):
+                raise OSError
+            forms.append((commands, witness))
+        return tuple(forms)
+
     def _stability_diagnostic(
         self,
         *,
@@ -1562,18 +1647,29 @@ class LinuxServiceProbe:
                 changed.append("cmdline")
             forms = {}
             try:
-                command = {
-                    "helixweave-api.service": "api",
-                    "helixweave-worker.service": "worker",
-                }[unit]
-                forms = {
-                    argv: name
-                    for (argv, _binary), name in zip(
-                        self._candidate_launch_forms(deployment_identity, command),
-                        ("dispatcher", "platform-launcher", "final-entry"),
-                        strict=True,
-                    )
-                }
+                if unit == "helixweave-docker-rootless.service":
+                    forms = {
+                        argv: name
+                        for (commands, _binary), name in zip(
+                            self._docker_launch_forms(),
+                            ("rootless-script", "rootlesskit-parent"),
+                            strict=True,
+                        )
+                        for argv in commands
+                    }
+                else:
+                    command = {
+                        "helixweave-api.service": "api",
+                        "helixweave-worker.service": "worker",
+                    }[unit]
+                    forms = {
+                        argv: name
+                        for (argv, _binary), name in zip(
+                            self._candidate_launch_forms(deployment_identity, command),
+                            ("dispatcher", "platform-launcher", "final-entry"),
+                            strict=True,
+                        )
+                    }
             except Exception:
                 pass  # A candidate lookup failure is not evidence of a known form.
             record = {
@@ -1642,6 +1738,11 @@ class LinuxServiceProbe:
                 if allow_socket_pending and unit == "helixweave-worker.service"
                 else None
             )
+            docker_forms = (
+                self._docker_launch_forms()
+                if allow_socket_pending and unit == "helixweave-docker-rootless.service"
+                else None
+            )
             process = self.proc_root / str(main_pid)
             raw_stat = (process / "stat").read_bytes()
             closing = raw_stat.rfind(b")")
@@ -1650,7 +1751,7 @@ class LinuxServiceProbe:
             executable = (process / "exe").stat()
             cmdline = (process / "cmdline").read_bytes()
             boot = (self.proc_root / "sys/kernel/random/boot_id").read_bytes()
-            if worker_forms is not None:
+            if worker_forms is not None or docker_forms is not None:
                 worker_status = (process / "status").read_bytes()
         except (OSError, ValueError, IndexError, StableBoundaryError):
             raise fail(
@@ -1697,7 +1798,7 @@ class LinuxServiceProbe:
             final_start_ticks = int(final_fields[19])
             final_executable = (process / "exe").stat()
             final_cmdline = (process / "cmdline").read_bytes()
-            if worker_forms is not None:
+            if worker_forms is not None or docker_forms is not None:
                 final_worker_status = (process / "status").read_bytes()
                 account = pwd.getpwnam("helixweave")
                 for raw_status in (worker_status, final_worker_status):
@@ -1721,6 +1822,7 @@ class LinuxServiceProbe:
             or final_start_ticks != start_ticks
             or (
                 worker_forms is None
+                and docker_forms is None
                 and (
                     _file_witness(final_executable) != _file_witness(executable)
                     or final_cmdline != cmdline
@@ -1746,6 +1848,58 @@ class LinuxServiceProbe:
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
             )
+        if docker_forms is not None:
+            stages = []
+            for command, binary in (
+                (cmdline, executable),
+                (final_cmdline, final_executable),
+            ):
+                stage = next(
+                    (
+                        i
+                        for i, (commands, expected_binary) in enumerate(docker_forms)
+                        if command in commands
+                        and _file_witness(binary) == _file_witness(expected_binary)
+                    ),
+                    None,
+                )
+                if stage is None or (
+                    stages
+                    and (
+                        stage < stages[-1]
+                        or (stage == stages[-1] and command != cmdline)
+                    )
+                ):
+                    self._stability_diagnostic(
+                        unit=unit,
+                        deployment_identity=deployment_identity,
+                        task_identity=task_identity,
+                        values=values,
+                        final_values=final_values,
+                        closing=closing,
+                        final_closing=final_closing,
+                        start_ticks=start_ticks,
+                        final_start_ticks=final_start_ticks,
+                        executable=executable,
+                        final_executable=final_executable,
+                        cmdline=cmdline,
+                        final_cmdline=final_cmdline,
+                    )
+                    raise fail(
+                        "OPERATOR_SERVICE_OBSERVE_FAILED",
+                        "Service status could not be observed.",
+                    )
+                stages.append(stage)
+            if stages != [1, 1]:
+                raise _ServiceReadinessPending(
+                    (
+                        main_pid,
+                        start_ticks,
+                        _bytes_identity(values["InvocationID"].encode()),
+                        _bytes_identity(boot.strip()),
+                    ),
+                    docker_stages=(stages[0], stages[1]),
+                )
         if worker_forms is not None:
             stages = []
             for command, binary in (
@@ -1791,7 +1945,8 @@ class LinuxServiceProbe:
                     start_ticks,
                     _bytes_identity(values["InvocationID"].encode()),
                     _bytes_identity(boot.strip()),
-                )
+                ),
+                docker_stages=(1, 1) if docker_forms is not None else None,
             )
         return ServiceIdentity.create(
             unit=unit,
@@ -2192,6 +2347,7 @@ class SystemdServiceController:
         assert readiness_deadline is not None
         api_process = None
         worker_stage = -1
+        docker_stage = -1
         while True:
             if time.monotonic() >= readiness_deadline:
                 raise fail(
@@ -2228,6 +2384,16 @@ class SystemdServiceController:
                             "Service status could not be observed.",
                         ) from None
                     worker_stage = pending.worker_stages[1]
+                if (
+                    request.unit == "helixweave-docker-rootless.service"
+                    and pending.docker_stages is not None
+                ):
+                    if pending.docker_stages[0] < docker_stage:
+                        raise fail(
+                            "OPERATOR_SERVICE_OBSERVE_FAILED",
+                            "Service status could not be observed.",
+                        ) from None
+                    docker_stage = pending.docker_stages[1]
                 remaining = readiness_deadline - time.monotonic()
                 if remaining <= 0:
                     raise fail(

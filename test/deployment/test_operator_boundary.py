@@ -2019,6 +2019,21 @@ def _docker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (group / "cgroup.procs").write_text("123\n")
     values["ControlGroup"] = f"/system.slice/{unit}"
     probe.unix_sockets[unit] = probe.unix_sockets["helixweave-redis.service"]
+    process = probe.proc_root / "123"
+    uid, gid = os.getuid(), os.getgid()
+    (process / "status").write_text(
+        f"Uid:\t{uid} {uid} {uid} {uid}\nGid:\t{gid} {gid} {gid} {gid}\n"
+    )
+    monkeypatch.setattr(
+        operator_module.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=uid, pw_gid=gid),
+    )
+    forms = (
+        ((b"fixed-rootless-script\0",), Path(sys.executable).stat()),
+        (((process / "cmdline").read_bytes(),), Path(sys.executable).stat()),
+    )
+    monkeypatch.setattr(probe, "_docker_launch_forms", lambda: forms)
 
     def control(action, name):
         assert (action, name) == ("start", unit)
@@ -2031,6 +2046,158 @@ def _docker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         operator_module.time, "sleep", lambda d: now.__setitem__(0, now[0] + d)
     )
     return controller, probe, replace(request, unit=unit), values, now
+
+
+@pytest.mark.parametrize("during_observation", (False, True))
+def test_docker_start_accepts_only_verified_script_to_rootlesskit_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during_observation: bool
+) -> None:
+    controller, probe, request, _values, now = _docker_start_probe(
+        tmp_path, monkeypatch
+    )
+    process = probe.proc_root / "123"
+    shell = tmp_path / "shell"
+    shell.write_bytes(b"fixed-shell")
+    forms = (
+        ((b"fixed-rootless-script\0",), shell.stat()),
+        ((b"fixed-rootlesskit-parent\0",), Path(sys.executable).stat()),
+    )
+    monkeypatch.setattr(probe, "_docker_launch_forms", lambda: forms)
+
+    def set_stage(stage):
+        (process / "exe").unlink()
+        (process / "exe").symlink_to(
+            shell if stage == 0 else Path(sys.executable).resolve()
+        )
+        (process / "cmdline").write_bytes(forms[stage][0][0])
+
+    set_stage(0)
+    original = probe._socket_witnesses
+    observations = []
+
+    def sockets(**kwargs):
+        observations.append(1)
+        if during_observation:
+            set_stage(1)
+        return original(**kwargs)
+
+    monkeypatch.setattr(probe, "_socket_witnesses", sockets)
+
+    def advance(delay):
+        now[0] += delay
+        set_stage(1)
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    saved = []
+    monkeypatch.setattr(controller, "_write_identity", saved.append)
+    result = controller.start(request)
+    assert saved == [result] and len(observations) == 2
+    assert result.cmdline_identity == operator_module._bytes_identity(forms[1][0][0])
+    assert result.main_pid == 123 and result.process_start_ticks == 5678
+    assert now[0] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("case", ("unknown", "restart", "timeout", "status-exec"))
+def test_docker_exec_readiness_does_not_accept_unknown_or_unstable_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    controller, probe, request, values, now = _docker_start_probe(tmp_path, monkeypatch)
+    process = probe.proc_root / "123"
+    forms = (
+        ((b"fixed-rootless-script\0",), Path(sys.executable).stat()),
+        ((b"fixed-rootlesskit-parent\0",), Path(sys.executable).stat()),
+    )
+    monkeypatch.setattr(probe, "_docker_launch_forms", lambda: forms)
+    (process / "cmdline").write_bytes(
+        b"unknown\0" if case == "unknown" else forms[0][0][0]
+    )
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _v: pytest.fail("persisted")
+    )
+
+    def advance(delay):
+        assert case in {"restart", "timeout"}, "hard failure retried"
+        now[0] += delay
+        if case == "restart":
+            values["InvocationID"] = "b" * 32
+            (process / "cmdline").write_bytes(forms[1][0][0])
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    if case == "status-exec":
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+        original = probe._socket_witnesses
+
+        def sockets(**kwargs):
+            (process / "cmdline").write_bytes(forms[1][0][0])
+            return original(**kwargs)
+
+        monkeypatch.setattr(probe, "_socket_witnesses", sockets)
+    with pytest.raises(DeploymentError) as caught:
+        if case == "status-exec":
+            probe.observe(
+                unit=request.unit,
+                deployment_identity=IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+        else:
+            controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if case == "timeout"
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    assert now[0] == pytest.approx(
+        15.0 if case == "timeout" else 0.1 if case == "restart" else 0
+    )
+
+
+def test_docker_launch_forms_come_from_verified_script_and_shipped_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe, _ = _unix_socket_probe(tmp_path)
+    script = b"#!/bin/sh\n# fixed fixture\n"
+    unit = (TEMPLATES / "helixweave-docker-rootless.service").read_bytes()
+    witness = SimpleNamespace(st_mode=stat.S_IFREG | 0o555, st_uid=0, st_gid=0)
+    monkeypatch.setattr(
+        operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
+    )
+    monkeypatch.setattr(
+        operator_module,
+        "_DOCKER_ROOTLESS_SCRIPT_SHA256",
+        hashlib.sha256(script).hexdigest(),
+    )
+    monkeypatch.setattr(
+        operator_module,
+        "read_regular_file",
+        lambda path, **_kw: (
+            script if str(path) == "/usr/bin/dockerd-rootless.sh" else unit,
+            witness,
+        ),
+    )
+    original = Path.stat
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda path, *a, **kw: (
+            witness
+            if str(path) in {"/bin/sh", "/usr/bin/rootlesskit"}
+            else original(path, *a, **kw)
+        ),
+    )
+    forms = probe._docker_launch_forms()
+    assert len(forms) == 2 and len(forms[0][0]) == 1 and len(forms[1][0]) == 4
+    assert forms[0][0][0].startswith(b"/bin/sh\0/usr/bin/dockerd-rootless.sh\0")
+    assert all(
+        c.startswith(
+            b"rootlesskit\0--state-dir=/run/helixweave/docker/dockerd-rootless\0"
+        )
+        and c.endswith(b"--group=0\0")
+        for c in forms[1][0]
+    )
+    assert any(b"--net=gvisor-tap-vsock\0--mtu=65520\0" in c for c in forms[1][0])
+    monkeypatch.setattr(operator_module, "_DOCKER_ROOTLESS_SCRIPT_SHA256", "0" * 64)
+    with pytest.raises(OSError):
+        probe._docker_launch_forms()
 
 
 @pytest.mark.parametrize("boundary", ("fd", "pid-directory"))
