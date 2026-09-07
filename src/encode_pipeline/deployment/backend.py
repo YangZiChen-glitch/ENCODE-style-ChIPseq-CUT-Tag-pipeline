@@ -672,7 +672,7 @@ class ProductionCommandBackend:
             database_identity, database_reason = self._database_status(
                 verified, observation
             )
-            if verification is not None:
+            if verification is not None and database_reason == "DATABASE_READY":
                 frontend_identity = verification.frontend_identity
                 database_identity = verification.database_after_identity
                 database_reason = (
@@ -680,8 +680,10 @@ class ProductionCommandBackend:
                     if database_identity is not None
                     else "DATABASE_UNAVAILABLE"
                 )
-            passed = verification is not None and _verification_ready(
-                verification, verified
+            passed = (
+                database_reason == "DATABASE_READY"
+                and verification is not None
+                and _verification_ready(verification, verified)
             )
         except DeploymentError:
             verified = status
@@ -827,19 +829,23 @@ class ProductionCommandBackend:
         status: DeploymentStatus,
         observation: OperatorObservation | None,
     ) -> tuple[str | None, str]:
-        if observation is not None and observation.database_schema_identity is not None:
-            manifest = status.manifests[PLATFORM]["active"]
-            if manifest is None:
-                return None, "DATABASE_UNAVAILABLE"
-            try:
-                target = self.manager.admit_manifest(manifest).database_heads
-            except DeploymentError:
-                return None, "DATABASE_UNAVAILABLE"
-            if (
-                len(observation.database_schema_heads) != 1
-                or observation.database_schema_heads != target
-            ):
-                return None, "DATABASE_UNAVAILABLE"
+        # The root observation has compared SQLite's online heads with the
+        # active Platform's admitted inventory. The public manager intentionally
+        # has a DeferredNativeContractResolver; it only projects bound evidence.
+        if observation is not None and (
+            observation.state_identity != status.state.identity
+            or observation.active
+            != {
+                component: status.state.components[component].active
+                for component in COMPONENTS
+            }
+            or observation.active[PLATFORM] is None
+            or (
+                observation.database_schema_identity is not None
+                and len(observation.database_schema_heads) != 1
+            )
+        ):
+            return None, "DATABASE_UNAVAILABLE"
         if observation is not None:
             return (
                 observation.database_schema_identity,

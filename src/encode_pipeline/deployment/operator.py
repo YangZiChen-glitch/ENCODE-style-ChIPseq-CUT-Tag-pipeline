@@ -3104,12 +3104,20 @@ class FixedObservationProvider:
             raise fail("OPERATOR_REQUEST_INVALID", "Operator request is invalid.")
         state = self._read_state(request.deployment_identity)
         try:
-            inspection = observe_online_database(
-                self.layout.database,
-                expected_owner_uid=self.service_uid,
-                expected_owner_gid=self.service_gid,
-                writer_uids=_online_database_writer_uids(),
-            )
+            with _operator_phase("online-database-query", request):
+                inspection = observe_online_database(
+                    self.layout.database,
+                    expected_owner_uid=self.service_uid,
+                    expected_owner_gid=self.service_gid,
+                    writer_uids=_online_database_writer_uids(),
+                )
+            with _operator_phase("online-schema-compatibility", request):
+                target = self._active_schema_target(state)
+                if inspection.schema_heads != target:
+                    raise fail(
+                        "DEPLOYMENT_SCHEMA_INCOMPATIBLE",
+                        "Database schema is not compatible with the deployment.",
+                    )
         except DeploymentError:
             inspection = None
         schema_identity = None if inspection is None else inspection.identity
@@ -3146,6 +3154,73 @@ class FixedObservationProvider:
             ),
             services=services,
         )
+
+    def _active_schema_target(self, state: DeploymentState) -> tuple[str, ...]:
+        """Reopen the active, natively admitted migration document, not all bundles.
+
+        Activation already verified this inventory against the candidate wheel
+        and migration graph. Read only its exact indexed bytes under the immutable
+        root-owned release; do not infer a schema from the operator's own version.
+        Full native verification remains the separate verify operation.
+        """
+        code = "DEPLOYMENT_CONTRACT_ADMISSION_FAILED"
+        try:
+            identity = state.components[PLATFORM].active
+            if identity is None:
+                raise ValueError
+            manifest = BundleStore(self.layout).read_installed_manifest(
+                PLATFORM,
+                identity,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            )
+            binding = next(
+                item
+                for item in manifest.contracts
+                if item.contract == "helixweave.platform.database-migrations"
+            )
+            record = next(item for item in manifest.files if item.path == binding.path)
+            root = self.layout.component_store(PLATFORM) / identity
+            path = root
+            for part in Path(binding.path).parts[:-1]:
+                path = path / part
+                observed = path.lstat()
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or stat.S_IMODE(observed.st_mode) != 0o555
+                    or observed.st_uid != self.root_uid
+                    or observed.st_gid != self.root_gid
+                ):
+                    raise ValueError
+            content, observed = read_regular_file(
+                root / binding.path,
+                max_bytes=512 * 1024,
+                code=code,
+            )
+            digest = hashlib.sha256(content).hexdigest()
+            if (
+                len(content) != record.size_bytes
+                or digest != record.sha256
+                or binding.identity != f"sha256-{digest}"
+                or stat.S_IMODE(observed.st_mode) != record.mode
+                or record.mode != 0o444
+                or observed.st_uid != self.root_uid
+                or observed.st_gid != self.root_gid
+            ):
+                raise ValueError
+            inventory = json.loads(content, object_pairs_hook=_unique_object)
+            heads = inventory["heads"]
+            if (
+                inventory["inventory_id"] != "helixweave-platform-migrations"
+                or not isinstance(heads, list)
+                or len(heads) != 1
+                or not isinstance(heads[0], str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", heads[0]) is None
+            ):
+                raise ValueError
+            return tuple(heads)
+        except (OSError, ValueError, TypeError, KeyError, StopIteration):
+            raise fail(code, "Deployment contract admission failed.") from None
 
     def _read_state(self, expected_identity: str) -> DeploymentState:
         try:

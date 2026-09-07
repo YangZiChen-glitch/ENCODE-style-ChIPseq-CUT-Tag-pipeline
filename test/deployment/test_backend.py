@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -38,6 +38,7 @@ from encode_pipeline.deployment.operator_action import (
     DeploymentActionReceipt,
     ReadinessCheck,
 )
+from encode_pipeline.deployment.state import StateStore
 from .support import manager_for, manifest_for, write_bundle
 
 
@@ -966,8 +967,9 @@ def test_status_uses_root_observation_when_the_local_database_is_unreadable(
             lambda *_: OperatorObservation.create(
                 state_identity=observed.state_identity,
                 active=observed.active,
-                database_schema_identity=observed.database_schema_identity,
-                database_schema_heads=("wrong-head",),
+                # The root operator withholds schema evidence on incompatibility.
+                database_schema_identity=None,
+                database_schema_heads=(),
                 services=observed.services,
             ),
         )
@@ -1123,6 +1125,89 @@ def test_verify_and_doctor_consume_the_same_root_schema_observation(
         "reason_code": "DATABASE_READY",
         "evidence_identity": OTHER_IDENTITY,
     }
+
+
+@pytest.mark.parametrize(
+    "evidence", ["bound", "incompatible", "missing", "state", "active"]
+)
+def test_production_deferred_backend_projects_only_bound_root_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    setup = manager_for(layout)
+    setup.states = StateStore(layout, reader_gid=os.getgid(), service_gid=os.getgid())
+    manifest, payload = manifest_for(PLATFORM)
+    bundle = write_bundle(tmp_path / "platform.tar", manifest, payload)
+    setup.stage(bundle)
+    setup.activate(PLATFORM, expected_staged_identity=manifest.identity)
+    operator = _Operator(setup, bundle)
+    original = operator.observe(setup.status().state.identity, TASK)
+    raw = original.to_dict()
+    if evidence == "incompatible":
+        raw.update(database_schema_identity=None, database_schema_heads=[])
+    elif evidence == "state":
+        raw["state_identity"] = OTHER_IDENTITY
+    elif evidence == "active":
+        raw["active"] = {**original.active, PLATFORM: OTHER_IDENTITY}
+    observed = OperatorObservation.create(
+        state_identity=raw["state_identity"],
+        active=raw["active"],
+        database_schema_identity=raw["database_schema_identity"],
+        database_schema_heads=raw["database_schema_heads"],
+        services=raw["services"],
+    )
+
+    def observe(*_):
+        if evidence == "missing":
+            raise fail("OPERATOR_OBSERVATION_UNAVAILABLE", "Observation unavailable.")
+        return observed
+
+    monkeypatch.setattr(operator, "observe", observe)
+    monkeypatch.setattr(
+        backend_module.DeploymentLayout, "supported", classmethod(lambda cls: layout)
+    )
+    monkeypatch.setattr(
+        backend_module.DeploymentOwnership,
+        "root",
+        classmethod(lambda cls: setup.ownership),
+    )
+    monkeypatch.setattr(backend_module, "_operator_group_gid", os.getgid)
+    monkeypatch.setattr(backend_module, "_fixed_group_gid", lambda _: os.getgid())
+    monkeypatch.setattr(backend_module, "SudoOperatorClient", lambda: operator)
+    backend = ProductionCommandBackend.supported()
+    assert isinstance(backend.manager.contract_resolver, DeferredNativeContractResolver)
+    assert isinstance(backend.manager.schema_observer, DeferredDatabaseSchemaObserver)
+
+    ready = evidence == "bound"
+    if evidence in {"missing", "state", "active"}:
+        with pytest.raises(DeploymentError, match="OPERATOR_OBSERVATION_UNAVAILABLE"):
+            backend.status()
+    else:
+        status = backend.status().value
+        assert (status["database_schema_reason_code"] == "DATABASE_READY") is ready
+    database = next(
+        c for c in backend.doctor().value["checks"] if c["check_id"] == "database"
+    )
+    assert (database["reason_code"] == "DATABASE_READY") is ready
+    if evidence in {"missing", "state", "active"}:
+        with pytest.raises(DeploymentError, match="OPERATOR_OBSERVATION_UNAVAILABLE"):
+            backend.verify()
+    else:
+        result = backend.verify().value
+        assert result["verified"] is ready
+        assert (result["database_schema_identity"] is not None) is ready
+        if ready:
+            # A later storage snapshot cannot borrow an earlier native result.
+            current = backend.manager.verify_storage()
+            changed = replace(
+                current, state=current.state.stage(PLATFORM, OTHER_IDENTITY)
+            )
+            monkeypatch.setattr(backend.manager, "verify_storage", lambda: changed)
+            result = backend.verify().value
+            assert result["verified"] is False
+            assert result["database_schema_identity"] is None
 
 
 def test_verify_rejects_native_evidence_nullability_that_does_not_match_state(

@@ -348,6 +348,14 @@ constant. Its separate online schema identity records only device, inode and
 schema heads; it is never substituted for an offline inspection or backup
 witness. Connections close explicitly on success and failure, with no DML,
 migration, checkpoint, journal-mode change, `immutable` or `nolock` option.
+The root operator compares those heads with the current active Platform's
+natively admitted migration inventory, rechecking its indexed bytes and
+root-owned immutable file boundary. Status does not rehash unrelated runtime
+bundles. Only compatible observations carry a schema identity, bound to the
+observed state and active slots; the public CLI projects that result while
+retaining its deferred native resolver. Full `verify` still performs native
+admission independently. Query and compatibility failures have separate
+path-free operator diagnostic phases.
 The existing writer-stop, strict sidecar, full integrity and content checks
 remain mandatory for migration, backup and recovery. Final acceptance checks
 online diagnostics while the API/worker are running; any separate offline

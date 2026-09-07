@@ -31,7 +31,7 @@ from encode_pipeline.deployment.database import (
     observe_online_database,
 )
 from encode_pipeline.deployment.layout import DeploymentLayout
-from encode_pipeline.deployment.models import DeploymentState
+from encode_pipeline.deployment.models import BundleManifest, DeploymentState
 from encode_pipeline.deployment.operator import (
     CommandResult,
     FixedObservationProvider,
@@ -5918,6 +5918,92 @@ def test_incompatible_partial_assembly_is_rejected_without_side_effects(
     )
 
 
+@pytest.mark.parametrize(
+    "case", ["compatible", "wrong-schema", "changed-bytes", "unsafe-parent"]
+)
+def test_online_observation_uses_only_active_admitted_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    uid, gid = os.getuid(), os.getgid()
+    inventory = (
+        ROOT
+        / "src/encode_pipeline/persistence/migration-execution-inventory-1.0.0.json"
+    ).read_bytes()
+    target = tuple(json.loads(inventory)["heads"])
+    original, payload = manifest_for("platform")
+    binding = next(
+        c
+        for c in original.contracts
+        if c.contract == "helixweave.platform.database-migrations"
+    )
+    digest = hashlib.sha256(inventory).hexdigest()
+    payload[binding.path] = inventory
+    manifest = BundleManifest.create(
+        component="platform",
+        contracts=[
+            replace(c, identity=f"sha256-{digest}") if c == binding else c
+            for c in original.contracts
+        ],
+        files=[
+            replace(f, size_bytes=len(inventory), sha256=digest)
+            if f.path == binding.path
+            else f
+            for f in original.files
+        ],
+    )
+    store = BundleStore(layout)
+    store.stage(
+        write_bundle(tmp_path / "platform.tar", manifest, payload),
+        installed_owner_uid=uid,
+        installed_owner_gid=gid,
+    )
+    state = (
+        DeploymentState.initial()
+        .stage("platform", manifest.identity)
+        .activate("platform")
+    )
+    _write_operator_test_database(
+        layout, heads=target if case != "wrong-schema" else ("wrong",), value="retained"
+    )
+    provider = FixedObservationProvider(
+        layout,
+        _TrackingServices({}, []),
+        root_uid=uid,
+        root_gid=gid,
+        operator_group_gid=gid,
+        service_uid=uid,
+        service_gid=gid,
+    )
+    monkeypatch.setattr(provider, "_read_state", lambda _: state)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("status must not rehash all runtime bundles")
+
+    monkeypatch.setattr(BundleStore, "verify_installed", forbidden)
+    path = layout.component_store("platform") / manifest.identity / binding.path
+    if case == "changed-bytes":
+        path.chmod(0o644)
+        path.write_bytes(inventory.replace(target[0].encode(), b"wrong-schema"))
+        path.chmod(0o444)
+    elif case == "unsafe-parent":
+        path.parent.chmod(0o775)
+    observed = provider.observe(
+        OperatorRequest(
+            operation="observe",
+            deployment_identity=state.identity,
+            task_identity=TASK_IDENTITY,
+        )
+    )
+    assert observed.state_identity == state.identity
+    assert observed.active["platform"] == manifest.identity
+    assert (observed.database_schema_identity is not None) is (case == "compatible")
+    assert observed.database_schema_heads == (target if case == "compatible" else ())
+    assert _database_value(layout) == "retained"
+
+
 @pytest.mark.parametrize("online_head", ("schema-v1", "wrong-head"))
 def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
     tmp_path: Path,
@@ -5973,6 +6059,7 @@ def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
             service_uid=owner_uid,
             service_gid=owner_gid,
         )
+        monkeypatch.setattr(provider, "_active_schema_target", lambda _: ("schema-v1",))
         observation = provider.observe(
             OperatorRequest(
                 operation="observe",
@@ -5980,7 +6067,9 @@ def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
                 task_identity=TASK_IDENTITY,
             )
         )
-        assert observation.database_schema_heads == (online_head,)
+        assert observation.database_schema_heads == (
+            (online_head,) if online_head == "schema-v1" else ()
+        )
         request = OperatorRequest(
             operation="verify",
             deployment_identity=state.identity,
