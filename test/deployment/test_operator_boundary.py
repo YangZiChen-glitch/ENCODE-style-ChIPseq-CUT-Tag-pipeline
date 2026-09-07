@@ -1902,6 +1902,115 @@ def test_api_start_waits_for_same_invocation_then_persists_once(
     assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
 
 
+@pytest.mark.parametrize("case", ("changed-fields", "invalid-stat", "logging-failure"))
+def test_rejected_observe_diagnoses_the_same_snapshots_without_retry_or_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+    process = probe.proc_root / "123"
+    executable = (process / "exe").stat()
+    witness_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    final_executable = SimpleNamespace(
+        **{
+            k: getattr(executable, k) + (1 if case == "changed-fields" else 0)
+            for k in witness_fields
+        }
+    )
+    snapshots = []
+    read_counts = {}
+    original_read = Path.read_bytes
+    original_stat = Path.stat
+
+    def captured_stat(path, *args, **kwargs):
+        if path == process / "exe":
+            snapshots.append(path)
+            assert len(snapshots) <= 2, "diagnostic re-read executable"
+            return executable if len(snapshots) == 1 else final_executable
+        return original_stat(path, *args, **kwargs)
+
+    def captured_read(path):
+        if path in (process / "stat", process / "cmdline"):
+            read_counts[path.name] = read_counts.get(path.name, 0) + 1
+            assert read_counts[path.name] <= 2, "diagnostic re-read process"
+        return original_read(path)
+
+    def socket_observation(**_kwargs):
+        if case == "changed-fields":
+            values.update(
+                ActiveState="activating",
+                SubState="start",
+                MainPID="456",
+                InvocationID="b" * 32,
+                ControlGroup="/private/secret",
+                NeedDaemonReload="yes",
+            )
+            (process / "stat").write_bytes(b"123 (python) " + b"0 " * 19 + b"9999\n")
+        elif case == "invalid-stat":
+            (process / "stat").write_bytes(b") " + b"0 " * 19 + b"5678\n")
+        if case != "invalid-stat":
+            (process / "cmdline").write_bytes(b"/private/secret\0")
+        return (SocketWitness("api-http", 41, 4567, 4567),)
+
+    def unavailable_forms(*_args):
+        raise RuntimeError("/private/secret")
+
+    monkeypatch.setattr(Path, "stat", captured_stat)
+    monkeypatch.setattr(Path, "read_bytes", captured_read)
+    monkeypatch.setattr(probe, "_socket_witnesses", socket_observation)
+    monkeypatch.setattr(probe, "_candidate_launch_forms", unavailable_forms)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    monkeypatch.setattr(
+        operator_module.time, "sleep", lambda _s: pytest.fail("retried")
+    )
+    logs = []
+
+    def log(_priority, text):
+        if case == "logging-failure":
+            raise ValueError("secret log failure")
+        logs.append(text)
+
+    monkeypatch.setattr(operator_module.syslog, "syslog", log)
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+    assert "secret" not in str(caught.value)
+    assert read_counts == {"stat": 2, "cmdline": 2} and len(snapshots) == 2
+    if case == "logging-failure":
+        return
+    record = next(
+        json.loads(s.split(" ", 1)[1])
+        for s in logs
+        if json.loads(s.split(" ", 1)[1])["phase"] == "process-stability"
+    )
+    expected = (
+        ["systemd." + k for k in FixedSystemctl._SHOW_PROPERTIES]
+        + ["process_start_ticks"]
+        + ["executable." + k for k in witness_fields]
+        + ["cmdline"]
+        if case == "changed-fields"
+        else ["stat_parse_validity"]
+    )
+    assert record["changed_fields"] == expected
+    assert record["stat_parse_validity"] == {
+        "before": True,
+        "after": case != "invalid-stat",
+    }
+    assert record["launcher_forms"] == {"before": "unknown", "after": "unknown"}
+    assert "secret" not in "".join(logs)
+
+
 def _docker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
     unit = "helixweave-docker-rootless.service"
@@ -2119,8 +2228,9 @@ def _worker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return controller, probe, request, values, forms, now
 
 
-def test_worker_argv_is_derived_from_bound_release_launcher(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("command", ("api", "worker"))
+def test_service_argv_is_derived_from_bound_release_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
 ) -> None:
     relative = "payload/platform/bin/helixweave-service"
     content = (TEMPLATES / "helixweave-service").read_bytes()
@@ -2142,7 +2252,9 @@ def test_worker_argv_is_derived_from_bound_release_launcher(
     monkeypatch.setattr(
         operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
     )
-    forms = probe._worker_launch_forms(manifest.identity)
+    forms = probe._candidate_launch_forms(manifest.identity, command)
+    if command == "worker":
+        assert forms == probe._worker_launch_forms(manifest.identity)
     release = layout.platform_releases / manifest.identity
     main = runpy.run_path(str(TEMPLATES / "helixweave-service"))["main"]
     calls = []
@@ -2154,15 +2266,44 @@ def test_worker_argv_is_derived_from_bound_release_launcher(
     monkeypatch.setattr(
         os, "execve", lambda executable, argv, env: calls.append((executable, argv))
     )
-    assert main(("worker",)) == 70  # execve was recorded, not executed.
+    assert main((command,)) == 70  # execve was recorded, not executed.
     assert forms[2][0] == b"\0".join(a.encode() for a in calls[0][1]) + b"\0"
     assert str(release).encode() in forms[1][0] and str(release).encode() in forms[2][0]
+    logs = []
+    monkeypatch.setattr(operator_module.syslog, "syslog", lambda _p, s: logs.append(s))
+    # The forms used for diagnostics come from these verified candidate bytes,
+    # not from the observed command. Unknown/other-candidate argv stays unknown.
+    for before, after, names in (
+        (forms[0][0], forms[1][0], ("dispatcher", "platform-launcher")),
+        (forms[1][0], forms[2][0], ("platform-launcher", "final-entry")),
+        (forms[2][0], b"private-token/unknown\0", ("final-entry", "unknown")),
+    ):
+        probe._stability_diagnostic(
+            unit=f"helixweave-{command}.service",
+            deployment_identity=manifest.identity,
+            task_identity=TASK_IDENTITY,
+            values={},
+            final_values={},
+            closing=12,
+            final_closing=12,
+            start_ticks=1,
+            final_start_ticks=1,
+            executable=forms[0][1],
+            final_executable=forms[0][1],
+            cmdline=before,
+            final_cmdline=after,
+        )
+        record = json.loads(logs[-1].split(" ", 1)[1])
+        assert record["launcher_forms"] == dict(zip(("before", "after"), names))
+        assert record["changed_fields"] == ["cmdline"]
+    assert str(release) not in "".join(logs)
+    assert "private-token" not in "".join(logs)
     binary = release / relative
     binary.chmod(0o755)
     binary.write_bytes(content + b"# drift\n")
     binary.chmod(0o555)
     with pytest.raises(OSError):
-        probe._worker_launch_forms(manifest.identity)
+        probe._candidate_launch_forms(manifest.identity, command)
 
 
 @pytest.mark.parametrize(

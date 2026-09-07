@@ -1411,7 +1411,14 @@ class LinuxServiceProbe:
     def _worker_launch_forms(
         self, deployment_identity: str
     ) -> tuple[tuple[bytes, os.stat_result], ...]:
+        return self._candidate_launch_forms(deployment_identity, "worker")
+
+    def _candidate_launch_forms(
+        self, deployment_identity: str, command: str
+    ) -> tuple[tuple[bytes, os.stat_result], ...]:
         """Read the selected release's launcher contract without executing it."""
+        if command not in {"api", "worker"}:
+            raise ValueError
         manifest = BundleStore(self.layout).read_installed_manifest(
             PLATFORM,
             deployment_identity,
@@ -1456,7 +1463,7 @@ class LinuxServiceProbe:
             f"sys.path.insert(0, {str(site_packages)!r})\n"
             "from pathlib import Path\n"
             "from encode_pipeline.deployment.platform_runtime import candidate_service_main\n"
-            "raise SystemExit(candidate_service_main(('worker',), "
+            f"raise SystemExit(candidate_service_main(({command!r},), "
             f"release_root=Path({str(release)!r})))\n"
         )
         commands = (
@@ -1464,9 +1471,9 @@ class LinuxServiceProbe:
                 "/usr/bin/python3",
                 "-I",
                 "/usr/libexec/helixweave-active-service",
-                "worker",
+                command,
             ),
-            (python, "-I", str(binary), "worker"),
+            (python, "-I", str(binary), command),
             (python, "-I", "-S", "-c", bootstrap),
         )
         forms = []
@@ -1482,6 +1489,90 @@ class LinuxServiceProbe:
                 raise OSError
             forms.append((b"\0".join(a.encode() for a in argv) + b"\0", executable))
         return tuple(forms)
+
+    def _stability_diagnostic(
+        self,
+        *,
+        unit: str,
+        deployment_identity: str,
+        task_identity: str,
+        values: dict[str, str],
+        final_values: dict[str, str],
+        closing: int,
+        final_closing: int,
+        start_ticks: int,
+        final_start_ticks: int,
+        executable: os.stat_result,
+        final_executable: os.stat_result,
+        cmdline: bytes,
+        final_cmdline: bytes,
+    ) -> None:
+        """Describe the rejected snapshots, never re-observe the failed process."""
+        try:
+            changed = [
+                "systemd." + name
+                for name in FixedSystemctl._SHOW_PROPERTIES
+                if values.get(name) != final_values.get(name)
+            ]
+            valid = (closing >= 1, final_closing >= 1)
+            if not all(valid):
+                changed.append("stat_parse_validity")
+            if start_ticks != final_start_ticks:
+                changed.append("process_start_ticks")
+            for name in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            ):
+                if getattr(executable, name) != getattr(final_executable, name):
+                    changed.append("executable." + name)
+            if cmdline != final_cmdline:
+                changed.append("cmdline")
+            forms = {}
+            try:
+                command = {
+                    "helixweave-api.service": "api",
+                    "helixweave-worker.service": "worker",
+                }[unit]
+                forms = {
+                    argv: name
+                    for (argv, _binary), name in zip(
+                        self._candidate_launch_forms(deployment_identity, command),
+                        ("dispatcher", "platform-launcher", "final-entry"),
+                        strict=True,
+                    )
+                }
+            except Exception:
+                pass  # A candidate lookup failure is not evidence of a known form.
+            record = {
+                "phase": "process-stability",
+                "code": "OBSERVATION_CHANGED",
+                "changed_fields": changed,
+                "stat_parse_validity": {"before": valid[0], "after": valid[1]},
+                "launcher_forms": {
+                    "before": forms.get(cmdline, "unknown"),
+                    "after": forms.get(final_cmdline, "unknown"),
+                },
+            }
+            if unit in SERVICE_UNITS:
+                record["unit"] = unit
+            if _valid_task_identity(task_identity):
+                record["task_identity"] = task_identity
+            if _CONTENT_IDENTITY.fullmatch(deployment_identity):
+                record["deployment_identity"] = deployment_identity
+            syslog.syslog(
+                syslog.LOG_INFO,
+                "helixweave-observation "
+                + canonical_json_bytes(record).decode().strip(),
+            )
+        except Exception:
+            pass  # Diagnostics cannot replace the original observation rejection.
 
     def _observe(
         self,
@@ -1610,6 +1701,21 @@ class LinuxServiceProbe:
                 )
             )
         ):
+            self._stability_diagnostic(
+                unit=unit,
+                deployment_identity=deployment_identity,
+                task_identity=task_identity,
+                values=values,
+                final_values=final_values,
+                closing=closing,
+                final_closing=final_closing,
+                start_ticks=start_ticks,
+                final_start_ticks=final_start_ticks,
+                executable=executable,
+                final_executable=final_executable,
+                cmdline=cmdline,
+                final_cmdline=final_cmdline,
+            )
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
