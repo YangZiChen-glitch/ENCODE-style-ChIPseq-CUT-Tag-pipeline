@@ -46,6 +46,7 @@ from encode_pipeline.deployment.database import (
     database_content_identity,
     fresh_database_candidate_path,
     inspect_database,
+    observe_online_database,
     publish_fresh_database,
     quarantine_invalid_fresh_database,
     quarantine_fresh_database,
@@ -3069,6 +3070,13 @@ class ObservationProvider(Protocol):
     def observe(self, request: OperatorRequest) -> OperatorObservation: ...
 
 
+def _online_database_writer_uids() -> tuple[int, ...]:
+    try:
+        return (pwd.getpwnam("helixweave-api").pw_uid,)
+    except KeyError:
+        return ()  # No API account can own a legitimate sidecar on this host.
+
+
 class FixedObservationProvider:
     """Read one descriptor-pinned state/schema/service snapshot without writes."""
 
@@ -3096,16 +3104,15 @@ class FixedObservationProvider:
             raise fail("OPERATOR_REQUEST_INVALID", "Operator request is invalid.")
         state = self._read_state(request.deployment_identity)
         try:
-            inspection = inspect_database(
+            inspection = observe_online_database(
                 self.layout.database,
                 expected_owner_uid=self.service_uid,
                 expected_owner_gid=self.service_gid,
+                writer_uids=_online_database_writer_uids(),
             )
         except DeploymentError:
             inspection = None
-        schema_identity = (
-            None if inspection is None else database_content_identity(inspection)
-        )
+        schema_identity = None if inspection is None else inspection.identity
         active = {
             component: state.components[component].active for component in COMPONENTS
         }
@@ -4691,14 +4698,20 @@ class HostDeploymentActionController:
             target_schema_heads = _candidate_schema_target(receipt)
             database_exists = self._database_exists()
             database = (
-                inspect_database(
+                observe_online_database(
                     self.layout.database,
                     expected_owner_uid=self.service_uid,
                     expected_owner_gid=self.service_gid,
+                    writer_uids=_online_database_writer_uids(),
                 )
                 if database_exists
                 else None
             )
+            if database is not None and database.schema_heads != target_schema_heads:
+                raise fail(
+                    "DEPLOYMENT_SCHEMA_INCOMPATIBLE",
+                    "Database schema is not compatible with the deployment.",
+                )
             native_checks = {
                 PLATFORM: "platform-native",
                 ENCODE_RUNTIME: "encode-runtime-native",
@@ -4729,7 +4742,7 @@ class HostDeploymentActionController:
                     "OPERATOR_ACTION_RECEIPT_INVALID",
                     "Operator action receipt is invalid.",
                 )
-            database_identity = database_content_identity(database)
+            database_identity = database.identity
             readiness = dict(receipt.readiness)
             readiness["database-schema"] = ReadinessCheck(
                 "ready", "READY", database_identity

@@ -338,6 +338,21 @@ Docker to be running and does not treat an externally prepared reference that
 has not yet been registered as corrupt deployment content; those operational
 conditions belong to `doctor`. Neither command silently repairs state.
 
+The database part of `status`, `doctor`, and `verify` is an online readability
+and candidate-schema check, not an offline database-content or integrity
+attestation. A bounded stdlib-only SQLite reader runs as the database owner
+with `mode=ro` and normal locking/WAL semantics, including committed pages in
+WAL and legitimate API/worker-owned SHM. It pins and rechecks the main file's
+path, owner and inode but does not require mutable bytes or timestamps to stay
+constant. Its separate online schema identity records only device, inode and
+schema heads; it is never substituted for an offline inspection or backup
+witness. Connections close explicitly on success and failure, with no DML,
+migration, checkpoint, journal-mode change, `immutable` or `nolock` option.
+The existing writer-stop, strict sidecar, full integrity and content checks
+remain mandatory for migration, backup and recovery. Final acceptance checks
+online diagnostics while the API/worker are running; any separate offline
+integrity evidence is labelled and retained independently.
+
 ### Deployment Gate operator flow
 
 The deployment Gate is a bounded release check, not a product runtime or a

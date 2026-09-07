@@ -827,6 +827,19 @@ class ProductionCommandBackend:
         status: DeploymentStatus,
         observation: OperatorObservation | None,
     ) -> tuple[str | None, str]:
+        if observation is not None and observation.database_schema_identity is not None:
+            manifest = status.manifests[PLATFORM]["active"]
+            if manifest is None:
+                return None, "DATABASE_UNAVAILABLE"
+            try:
+                target = self.manager.admit_manifest(manifest).database_heads
+            except DeploymentError:
+                return None, "DATABASE_UNAVAILABLE"
+            if (
+                len(observation.database_schema_heads) != 1
+                or observation.database_schema_heads != target
+            ):
+                return None, "DATABASE_UNAVAILABLE"
         if observation is not None:
             return (
                 observation.database_schema_identity,

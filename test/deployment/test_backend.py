@@ -937,9 +937,11 @@ def test_rollback_requires_and_activates_the_exact_previous_identity(
     assert operator.calls == [("rollback", PLATFORM, previous.identity, TASK)]
 
 
+@pytest.mark.parametrize("schema_matches", (True, False))
 def test_status_uses_root_observation_when_the_local_database_is_unreadable(
     tmp_path: Path,
     monkeypatch,
+    schema_matches: bool,
 ) -> None:
     layout = DeploymentLayout.isolated(tmp_path / "host")
     manager = manager_for(layout)
@@ -956,6 +958,19 @@ def test_status_uses_root_observation_when_the_local_database_is_unreadable(
 
     monkeypatch.setattr(manager, "observe_database_schema", unavailable)
     operator = _Operator(manager, bundle)
+    if not schema_matches:
+        observed = operator.observe(manager.status().state.identity, TASK)
+        monkeypatch.setattr(
+            operator,
+            "observe",
+            lambda *_: OperatorObservation.create(
+                state_identity=observed.state_identity,
+                active=observed.active,
+                database_schema_identity=observed.database_schema_identity,
+                database_schema_heads=("wrong-head",),
+                services=observed.services,
+            ),
+        )
     backend = ProductionCommandBackend(
         layout=layout,
         manager=manager,
@@ -967,8 +982,12 @@ def test_status_uses_root_observation_when_the_local_database_is_unreadable(
     result = backend.status()
 
     assert result.value["schema_version"] == STATUS_RESULT_SCHEMA
-    assert result.value["database_schema_identity"] == OTHER_IDENTITY
-    assert result.value["database_schema_reason_code"] == "DATABASE_READY"
+    assert result.value["database_schema_identity"] == (
+        OTHER_IDENTITY if schema_matches else None
+    )
+    assert result.value["database_schema_reason_code"] == (
+        "DATABASE_READY" if schema_matches else "DATABASE_UNAVAILABLE"
+    )
 
 
 def test_status_fails_closed_instead_of_zeroing_unknown_operator_counts(

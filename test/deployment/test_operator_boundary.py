@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from contextlib import closing
 import errno
 import importlib.util
 import hashlib
@@ -27,6 +28,7 @@ from encode_pipeline.deployment.database import (
     database_content_identity,
     fresh_database_candidate_path,
     inspect_database,
+    observe_online_database,
 )
 from encode_pipeline.deployment.layout import DeploymentLayout
 from encode_pipeline.deployment.models import DeploymentState
@@ -4893,7 +4895,7 @@ def _write_operator_test_database(
     layout.run_root.chmod(0o755)
     layout.database.parent.mkdir(parents=True, exist_ok=True)
     layout.database.parent.chmod(0o2770)
-    with sqlite3.connect(layout.database) as connection:
+    with closing(sqlite3.connect(layout.database)) as connection, connection:
         connection.execute(
             "CREATE TABLE alembic_version (version_num VARCHAR(128) NOT NULL)"
         )
@@ -4907,7 +4909,9 @@ def _write_operator_test_database(
 
 
 def _database_value(layout: DeploymentLayout) -> str:
-    with sqlite3.connect(f"file:{layout.database}?mode=ro", uri=True) as connection:
+    with closing(
+        sqlite3.connect(f"file:{layout.database}?mode=ro", uri=True)
+    ) as connection:
         row = connection.execute("SELECT value FROM durable_state").fetchone()
     assert row is not None
     return str(row[0])
@@ -5914,9 +5918,11 @@ def test_incompatible_partial_assembly_is_rejected_without_side_effects(
     )
 
 
+@pytest.mark.parametrize("online_head", ("schema-v1", "wrong-head"))
 def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    online_head: str,
 ) -> None:
     layout = DeploymentLayout.isolated(tmp_path / "host")
     owner_uid = os.getuid()
@@ -5954,22 +5960,54 @@ def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
         service_gid=owner_gid,
     )
 
-    receipt = controller.verify(
-        OperatorRequest(
+    with closing(sqlite3.connect(layout.database)) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("UPDATE alembic_version SET version_num = ?", (online_head,))
+        writer.commit()
+        provider = FixedObservationProvider(
+            layout,
+            _TrackingServices({}, []),
+            root_uid=owner_uid,
+            root_gid=owner_gid,
+            operator_group_gid=owner_gid,
+            service_uid=owner_uid,
+            service_gid=owner_gid,
+        )
+        observation = provider.observe(
+            OperatorRequest(
+                operation="observe",
+                deployment_identity=state.identity,
+                task_identity=TASK_IDENTITY,
+            )
+        )
+        assert observation.database_schema_heads == (online_head,)
+        request = OperatorRequest(
             operation="verify",
             deployment_identity=state.identity,
             task_identity=TASK_IDENTITY,
         )
-    )
+        if online_head != "schema-v1":
+            with pytest.raises(DeploymentError, match="DEPLOYMENT_SCHEMA_INCOMPATIBLE"):
+                controller.verify(request)
+            return
+        receipt = controller.verify(request)
+        assert observation.database_schema_identity == receipt.database_after_identity
+        with pytest.raises(DeploymentError, match="DATABASE_SIDECAR_NOT_QUIESCENT"):
+            inspect_database(
+                layout.database,
+                expected_owner_uid=owner_uid,
+                expected_owner_gid=owner_gid,
+            )
 
     assert receipt.status == "observed"
     assert receipt.compatibility == "compatible"
-    assert receipt.database_after_identity == database_content_identity(
-        inspect_database(
+    assert (
+        receipt.database_after_identity
+        == observe_online_database(
             layout.database,
             expected_owner_uid=owner_uid,
             expected_owner_gid=owner_gid,
-        )
+        ).identity
     )
     assert (
         receipt.accepted_schema_heads == receipt.target_schema_heads == ("schema-v1",)

@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
 from typing import Any, Protocol
 import uuid
 from urllib.parse import quote
@@ -77,6 +78,7 @@ DATABASE_INVALID_FRESH_QUARANTINE_RECEIPT_IDENTITY_SCHEME = (
     "helixweave-database-invalid-fresh-quarantine-receipt-identity-v1"
 )
 DATABASE_CONTENT_IDENTITY_SCHEME = "helixweave-database-content-identity-v1"
+DATABASE_ONLINE_SCHEMA_IDENTITY_SCHEME = "helixweave-database-online-schema-v1"
 WRITE_STOP_ISSUER = "helixweave-root-operator-v1"
 DATABASE_WRITER_UNITS = (
     "helixweave-api.service",
@@ -1351,6 +1353,168 @@ def database_content_identity(inspection: DatabaseInspection) -> str:
         },
         scheme=DATABASE_CONTENT_IDENTITY_SCHEME,
     )
+
+
+@dataclass(frozen=True)
+class OnlineDatabaseObservation:
+    """Readable WAL-aware schema, not an offline integrity/content witness."""
+
+    schema_heads: tuple[str, ...]
+    device: int
+    inode: int
+
+    @property
+    def identity(self) -> str:
+        return canonical_identity(
+            {
+                "device": self.device,
+                "inode": self.inode,
+                "heads": list(self.schema_heads),
+            },
+            scheme=DATABASE_ONLINE_SCHEMA_IDENTITY_SCHEME,
+        )
+
+
+# Fixed stdlib-only query, executed as the database owner, never as root on the
+# production database. SQLite may maintain its normal WAL index; those files
+# must not acquire the privileged observer's ownership. No candidate code runs.
+_ONLINE_SCHEMA_QUERY = """
+import json, sqlite3, sys, time
+connection = None
+try:
+    connection = sqlite3.connect(sys.argv[1], uri=True, timeout=1.0)
+    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 4096)
+    connection.execute('PRAGMA query_only = ON')
+    deadline = time.monotonic() + 1.0
+    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    rows = connection.execute(
+        'SELECT version_num FROM alembic_version ORDER BY version_num LIMIT 2'
+    ).fetchall()
+    print(json.dumps([row[0] for row in rows], ensure_ascii=True))
+finally:
+    if connection is not None:
+        connection.close()
+"""
+
+
+def observe_online_database(
+    path: Path,
+    *,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+    writer_uids: tuple[int, ...] = (),
+) -> OnlineDatabaseObservation:
+    """Bounded normal read-only SQLite observation including committed WAL pages.
+
+    Pin the directory/main-file boundary, but do not freeze mutable content or
+    require empty sidecars. The separate offline inspector remains mandatory
+    for backup, migration and recovery. This function makes no integrity claim.
+    """
+    if any(type(uid) is not int or uid < 0 for uid in writer_uids):
+        raise fail("DATABASE_PATH_UNSAFE", "Database path boundary is unsafe.")
+    opened = _open_database(
+        path,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+    )
+    try:
+        parent_witness = _online_file_boundary(opened, writer_uids)
+        credentials: dict[str, Any] = {}
+        if os.geteuid() == 0:
+            credentials = {
+                "user": expected_owner_uid,
+                "group": expected_owner_gid,
+                "extra_groups": [],
+            }
+        elif (os.geteuid(), os.getegid()) != (expected_owner_uid, expected_owner_gid):
+            raise fail("DATABASE_UNAVAILABLE", "Database is unavailable.")
+        # The pinned directory retains the real database basename, so SQLite
+        # finds the real -wal/-shm and applies ordinary locking/WAL semantics.
+        uri = quote(
+            f"/proc/self/fd/{opened.directory_descriptor}/{path.name}", safe="/"
+        )
+        result = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                "-c",
+                _ONLINE_SCHEMA_QUERY,
+                f"file:{uri}?mode=ro",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(opened.directory_descriptor,),
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            umask=0o007,
+            timeout=3.0,
+            check=False,
+            **credentials,
+        )
+        if result.returncode != 0 or len(result.stdout) > 4096:
+            raise fail("DATABASE_INVALID", "Database is invalid or unreadable.")
+        heads = _schema_heads(json.loads(result.stdout), code="DATABASE_INVALID")
+        if _online_file_boundary(opened, writer_uids) != parent_witness:
+            raise fail("DATABASE_CHANGED", "Database changed during observation.")
+        return OnlineDatabaseObservation(
+            heads, opened.initial_stat.st_dev, opened.initial_stat.st_ino
+        )
+    except DeploymentError:
+        raise
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise fail("DATABASE_UNAVAILABLE", "Database is unavailable.") from None
+    finally:
+        opened.close()
+
+
+def _online_file_boundary(
+    opened: _OpenedDatabase, writer_uids: tuple[int, ...]
+) -> tuple[int, ...]:
+    def stable(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+        )
+
+    current = os.fstat(opened.descriptor)
+    named = os.stat(
+        opened.path.name, dir_fd=opened.directory_descriptor, follow_symlinks=False
+    )
+    parent = os.fstat(opened.directory_descriptor)
+    if (
+        stable(current) != stable(opened.initial_stat)
+        or not current.st_mode & stat.S_IRUSR
+        or stable(named) != stable(current)
+        or stable(opened.path.parent.lstat()) != stable(parent)
+        or opened.path.resolve(strict=True) != opened.path
+    ):
+        raise fail("DATABASE_CHANGED", "Database changed during observation.")
+    owners = {opened.initial_stat.st_uid, *writer_uids}
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            sidecar = os.stat(
+                f"{opened.path.name}{suffix}",
+                dir_fd=opened.directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        mode = stat.S_IMODE(sidecar.st_mode)
+        if (
+            not stat.S_ISREG(sidecar.st_mode)
+            or sidecar.st_nlink != 1
+            or sidecar.st_uid not in owners
+            or sidecar.st_gid != opened.initial_stat.st_gid
+            or (mode != 0o660 if opened.shared_group_write else mode & 0o022 != 0)
+        ):
+            raise fail("DATABASE_PATH_UNSAFE", "Database sidecar boundary is unsafe.")
+    return stable(parent)
 
 
 def fresh_database_candidate_path(layout: DeploymentLayout, task_identity: str) -> Path:
