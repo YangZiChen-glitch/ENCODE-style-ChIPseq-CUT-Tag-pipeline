@@ -3609,6 +3609,9 @@ class _RetainedRedisServices(SystemdServiceController):
     unit = "helixweave-redis.service"
 
     def __init__(self, layout):
+        self.live = True
+        self.redis_starts = 0
+        self.original_absent = True
         self.writers = _TrackingServices({}, [])
         self.queue = [b"task-only-queued-job", b"task-only-scheduled-job"]
         self.physical = ServiceIdentity.create(
@@ -3644,14 +3647,36 @@ class _RetainedRedisServices(SystemdServiceController):
             self.writers.running[unit] = self.writers._identity(request)
 
     def observe(self, *, unit, deployment_identity, task_identity):
+        if unit in WRITER_UNITS:
+            return self.writers.running.get(unit)
         assert unit == self.unit
+        if not self.live:
+            return None
         value = self._redis_bound_to(self.physical, deployment_identity)
         assert value.task_identity == task_identity
         return value
 
     def control(self, action, unit):
-        self.queue.clear()
-        raise AssertionError("retained Redis must never be controlled")
+        assert action == "start" and unit == self.unit and not self.live
+        assert not self.queue  # Explicit tests acknowledge already lost volatile data.
+        self.redis_starts += 1
+        raw = self.physical.to_dict()
+        del raw["identity"]
+        raw.update(
+            main_pid=raw["main_pid"] + 1,
+            process_start_ticks=raw["process_start_ticks"] + 1,
+            invocation_identity="sha256-" + "9" * 64,
+            deployment_identity=self.start_request.deployment_identity,
+            task_identity=self.start_request.task_identity,
+            sockets=self.physical.sockets,
+        )
+        self.physical = ServiceIdentity.create(**raw)
+        self.live = True
+
+    def require_process_absent(self, service):
+        assert service.main_pid == self.physical.main_pid
+        if not self.original_absent:
+            raise fail("OPERATOR_SERVICE_IDENTITY_MISMATCH", "Original process exists.")
 
     def _redis_requirements(self, deployment):
         return (
@@ -3669,7 +3694,9 @@ class _RetainedRedisServices(SystemdServiceController):
         return self.writers.status(request)
 
     def start(self, request):
-        assert request.unit != self.unit
+        if request.unit == self.unit:
+            self.start_request = request
+            return super().start(request)
         return self.writers.start(request)
 
     def stop(self, request, *, cleanup):
@@ -3947,6 +3974,180 @@ def test_retained_redis_binding_interruption_recovers_idempotently(
         with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
             controller._observe_recovery_service(record, WRITER_UNITS[0])
         _assert_redis_status(services, expected)
+
+
+def _stopped_retained_recovery_fixture(tmp_path):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    journals.recovery_controller = None
+    services.writers.fail_start_once = WRITER_UNITS[0]
+    with pytest.raises(DeploymentError):
+        _run_platform_transaction(controller, journals)
+    record = journals._read(layout.operator_transaction_active)
+    assert record.point_of_no_return and record.phase == "recovery-required"
+    services.live = False  # Model a previously stopped Redis, not a product restart.
+    services.queue.clear()
+    services.writers.running.clear()
+    backend = HostOperatorBackend(
+        layout=layout,
+        service_controller=services,
+        state_store=states,
+        deployment_controller=controller,
+        journal_store=journals,
+        root_uid=os.getuid(),
+        root_gid=os.getgid(),
+        operator_group_gid=os.getgid(),
+        service_uid=os.getuid(),
+        service_gid=os.getgid(),
+        api_uid=os.getuid() + 1,
+        api_gid=os.getgid() + 1,
+        candidate_uid=os.getuid() + 2,
+        candidate_gid=os.getgid() + 2,
+    )
+    request = OperatorRequest(
+        operation="start",
+        unit=services.unit,
+        deployment_identity=IDENTITY,
+        task_identity=record.task_identity,
+    )
+    return layout, states, services, controller, journals, backend, request, record
+
+
+@pytest.mark.parametrize(
+    "interrupt", (None, "before-result-checkpoint", "after-result-checkpoint")
+)
+def test_explicit_stopped_retained_redis_recovery_is_checkpointed_and_idempotent(
+    tmp_path, monkeypatch, interrupt
+):
+    layout, states, services, controller, journals, backend, request, record = (
+        _stopped_retained_recovery_fixture(tmp_path)
+    )
+    original_witness = record.evidence["retained_redis_identity"]
+    with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+        controller.recover(record)  # Ordinary reconciliation must not opt in.
+    assert services.redis_starts == 0
+    if interrupt:
+        replace_active = journals._replace_active
+
+        def interrupted(value, **kwargs):
+            if "retained_redis_replacement_identity" in value.evidence:
+                if interrupt == "after-result-checkpoint":
+                    replace_active(value, **kwargs)
+                raise OSError(errno.EIO, "private checkpoint failure")
+            return replace_active(value, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(journals, "_replace_active", interrupted)
+            with pytest.raises(OSError):
+                backend.execute(request, bundle_path=None)
+    result = backend.execute(request, bundle_path=None)
+    assert result.state == "running" and services.redis_starts == 1
+    assert backend.execute(request, bundle_path=None) == result
+    checkpoint = journals._read(layout.operator_transaction_active)
+    assert checkpoint.evidence["retained_redis_identity"] == original_witness
+    assert (
+        checkpoint.evidence["retained_redis_replacement_identity"]
+        == result.service.identity
+    )
+    assert checkpoint.failure_phase == record.failure_phase
+    assert checkpoint.task_identity == record.task_identity
+    assert checkpoint.deployment_identity == record.deployment_identity
+    assert checkpoint.phase == "recovery-required" and checkpoint.point_of_no_return
+    recovered = controller.recover(checkpoint)
+    assert recovered.phase == "complete"
+    assert controller.recover(checkpoint) == recovered
+    assert services.redis_starts == 1 and services.queue == []
+    assert _database_value(layout) == "preserved"
+    assert checkpoint.evidence.items() <= recovered.evidence.items()
+
+
+def test_explicit_recovery_keeps_a_surviving_retained_redis(tmp_path):
+    layout, states, services, controller, journals, backend, request, record = (
+        _stopped_retained_recovery_fixture(tmp_path)
+    )
+    services.live = True
+    services.queue = [b"task-only-retained-data"]
+    before = layout.operator_transaction_active.read_bytes()
+    result = backend.execute(request, bundle_path=None)
+    assert result.service.main_pid == services.physical.main_pid
+    assert services.redis_starts == 0
+    assert services.queue == [b"task-only-retained-data"]
+    assert layout.operator_transaction_active.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "unknown-process",
+        "configuration",
+        "original-still-present",
+        "wrong-task",
+        "wrong-candidate",
+    ),
+)
+def test_stopped_retained_redis_recovery_rejects_untrusted_replacements(
+    tmp_path, mismatch
+):
+    layout, states, services, controller, journals, backend, request, record = (
+        _stopped_retained_recovery_fixture(tmp_path)
+    )
+    before = layout.operator_transaction_active.read_bytes()
+    if mismatch == "unknown-process":
+        services.live = True
+        raw = services.physical.to_dict()
+        del raw["identity"]
+        raw.update(main_pid=9999, sockets=services.physical.sockets)
+        services.physical = ServiceIdentity.create(**raw)
+    elif mismatch == "configuration":
+        services.incompatible = IDENTITY
+    elif mismatch == "original-still-present":
+        services.original_absent = False
+    elif mismatch == "wrong-task":
+        request = replace(request, task_identity="task-" + "9" * 32)
+    else:
+        request = replace(request, deployment_identity=THIRD_IDENTITY)
+    with pytest.raises(DeploymentError):
+        backend.execute(request, bundle_path=None)
+    assert services.redis_starts == 0
+    assert layout.operator_transaction_active.read_bytes() == before
+
+
+@pytest.mark.parametrize("process", ("absent", "reused", "live", "denied"))
+def test_retained_process_absence_uses_boot_and_start_ticks(
+    tmp_path, monkeypatch, process
+):
+    service = _worker_service_identity()
+    proc = tmp_path / "proc"
+    boot = proc / "sys/kernel/random/boot_id"
+    boot.parent.mkdir(parents=True)
+    boot.write_bytes(b"test-boot\n")
+    service = replace(
+        service, boot_identity=operator_module._bytes_identity(b"test-boot")
+    )
+    target = proc / str(service.main_pid) / "stat"
+    if process != "absent":
+        target.parent.mkdir()
+        target.write_bytes(
+            b"1 (redis) S "
+            + b"0 " * 18
+            + str(service.process_start_ticks + (process == "reused")).encode()
+        )
+    if process == "denied":
+        read = Path.read_bytes
+
+        def denied(p):
+            if p == target:
+                raise PermissionError(errno.EACCES, "private")
+            return read(p)
+
+        monkeypatch.setattr(Path, "read_bytes", denied)
+    probe = LinuxServiceProbe(SimpleNamespace(), proc_root=proc)
+    if process in {"live", "denied"}:
+        with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+            probe.require_process_absent(service)
+    else:
+        probe.require_process_absent(service)
 
 
 def _supported_state_store(

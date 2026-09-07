@@ -1295,6 +1295,8 @@ class FixedSystemctl:
 
 
 class ServiceProbe(Protocol):
+    def require_process_absent(self, service: ServiceIdentity) -> None: ...
+
     def observe(
         self,
         *,
@@ -1406,6 +1408,30 @@ class LinuxServiceProbe:
             deployment_identity=deployment_identity,
             task_identity=task_identity,
             allow_socket_pending=True,
+        )
+
+    def require_process_absent(self, service: ServiceIdentity) -> None:
+        """A stopped unit alone does not prove its former PID has disappeared."""
+        try:
+            boot = (self.proc_root / "sys/kernel/random/boot_id").read_bytes()
+            if not 0 < len(boot) <= 128:
+                raise ValueError
+            if _bytes_identity(boot.strip()) != service.boot_identity:
+                return
+            try:
+                raw = (self.proc_root / str(service.main_pid) / "stat").read_bytes()
+            except FileNotFoundError:
+                return
+            closing = raw.rfind(b")")
+            if closing < 1 or len(raw) > _MAX_COMMAND_OUTPUT:
+                raise ValueError
+            if int(raw[closing + 2 :].split()[19]) != service.process_start_ticks:
+                return  # PID reuse is not survival of the retained process.
+        except (OSError, ValueError, IndexError):
+            pass
+        raise fail(
+            "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+            "Retained Redis process absence is unverified.",
         )
 
     def _worker_launch_forms(
@@ -2047,6 +2073,19 @@ class LinuxServiceProbe:
 
 
 class ServiceController(Protocol):
+    def recover_retained_redis_start(
+        self,
+        request: OperatorRequest,
+        *,
+        prior: str,
+        previous: str | None,
+        journal: OperatorJournalHandle,
+    ) -> ServiceIdentity: ...
+
+    def verify_redis_replacement(
+        self, record: OperatorTransaction, *, prior: str, candidate: str
+    ) -> ServiceIdentity: ...
+
     def prepare_redis_transfer(
         self,
         *,
@@ -2480,6 +2519,147 @@ class SystemdServiceController:
                 "OPERATOR_SERVICE_IDENTITY_MISMATCH",
                 "Retained Redis identity changed during the transaction.",
             )
+
+    def _redis_replacement_intent(
+        self, record: OperatorTransaction, prior: str, candidate: str
+    ) -> str:
+        requirements = self._redis_requirements(prior)
+        if self._redis_requirements(candidate) != requirements:
+            raise fail(
+                "DEPLOYMENT_COMPATIBILITY_FAILED",
+                "Retained Redis configuration is not compatible.",
+            )
+        return canonical_identity(
+            {
+                "task_identity": record.task_identity,
+                "prior": prior,
+                "candidate": candidate,
+                "retained_redis_identity": record.evidence["retained_redis_identity"],
+                "requirements": requirements,
+                "volatile_state_loss_accepted": True,
+            },
+            scheme="helixweave-retained-redis-replacement-v1",
+        )
+
+    def verify_redis_replacement(
+        self, record: OperatorTransaction, *, prior: str, candidate: str
+    ) -> ServiceIdentity:
+        if not record.point_of_no_return or record.evidence.get(
+            "retained_redis_replacement_intent"
+        ) != self._redis_replacement_intent(record, prior, candidate):
+            raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+        service = self.status(
+            OperatorRequest(
+                operation=STATUS,
+                task_identity=record.task_identity,
+                deployment_identity=candidate,
+                unit="helixweave-redis.service",
+            )
+        )
+        if (
+            service is None
+            or service.task_identity != record.task_identity
+            or service.identity
+            != record.evidence.get("retained_redis_replacement_identity")
+        ):
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Recovered Redis identity does not match this transaction.",
+            )
+        return service
+
+    def recover_retained_redis_start(
+        self,
+        request: OperatorRequest,
+        *,
+        prior: str,
+        previous: str | None,
+        journal: OperatorJournalHandle,
+    ) -> ServiceIdentity:
+        """Explicit journal-task START; never reached by status or transfer."""
+        record = journal.record
+        candidate = request.deployment_identity
+        witness = record.evidence["retained_redis_identity"]
+        intent = self._redis_replacement_intent(record, prior, candidate)
+        saved = self._read_identity("helixweave-redis.service", required=True)
+        assert saved is not None
+        observed = self.probe.observe(
+            unit=saved.unit,
+            deployment_identity=saved.deployment_identity,
+            task_identity=saved.task_identity,
+        )
+        recorded_intent = record.evidence.get("retained_redis_replacement_intent")
+        if recorded_intent is not None:
+            if recorded_intent != intent:
+                raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+            if observed is not None:
+                # An interrupted checkpoint may follow the atomic identity write.
+                # Require that trusted write, not merely a matching live process.
+                if (
+                    saved != observed
+                    or saved.task_identity != record.task_identity
+                    or saved.deployment_identity != candidate
+                    or self._redis_bound_to(saved, prior).identity == witness
+                ):
+                    raise fail(
+                        "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                        "Recovered Redis identity does not match this transaction.",
+                    )
+                journal.record_redis_replacement(
+                    "retained_redis_replacement_identity", saved.identity
+                )
+                return self.verify_redis_replacement(
+                    journal.record, prior=prior, candidate=candidate
+                )
+            if "retained_redis_replacement_identity" in record.evidence:
+                raise fail(
+                    "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                    "Recovered Redis process is no longer running.",
+                )
+        elif observed is not None:
+            self.transfer_redis_binding(
+                prior=prior,
+                candidate=candidate,
+                previous=previous,
+                witness=witness,
+                restore=False,
+            )
+            service = self.status(request)
+            assert service is not None
+            return service  # Live path retains PID, invocation, socket and queue.
+        if (
+            saved.deployment_identity not in {prior, candidate, previous}
+            or self._redis_bound_to(saved, prior).identity != witness
+            or self._redis_requirements(saved.deployment_identity)
+            != self._redis_requirements(prior)
+        ):
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity does not match this transaction.",
+            )
+        for unit in WRITER_UNITS:
+            if (
+                self.probe.observe(
+                    unit=unit,
+                    deployment_identity=candidate,
+                    task_identity=record.task_identity,
+                )
+                is not None
+            ):
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Writer services must be stopped before Redis recovery.",
+                )
+        self.probe.require_process_absent(saved)
+        journal.record_redis_replacement("retained_redis_replacement_intent", intent)
+        with _operator_phase("retained-redis-explicit-start", record):
+            service = self.start(request)
+        journal.record_redis_replacement(
+            "retained_redis_replacement_identity", service.identity
+        )
+        return self.verify_redis_replacement(
+            journal.record, prior=prior, candidate=candidate
+        )
 
     def stop(self, request: OperatorRequest, *, cleanup: bool) -> None:
         assert request.unit is not None and request.service_identity is not None
@@ -4958,6 +5138,46 @@ class HostDeploymentActionController:
             )
         return receipt
 
+    def recover_retained_redis_start(
+        self, request: OperatorRequest, *, journal: OperatorJournalHandle
+    ) -> ServiceIdentity:
+        record = journal.record
+        with self.states.transaction(
+            exclusive=False,
+            expected_owner_uid=self.root_uid,
+            expected_owner_gid=self.root_gid,
+        ) as transaction:
+            current = transaction.read()
+            if (
+                transaction.pending_transactions()
+                or current.identity != record.candidate_state_identity
+                or {k: v.active for k, v in current.components.items()}
+                != record.candidate_active
+                or record.prior_state_identity is None
+            ):
+                raise fail(
+                    "OPERATOR_STATE_IDENTITY_MISMATCH",
+                    "Operator state identity does not match recovery.",
+                )
+            prior = self.states._load_generation_locked(
+                record.prior_state_identity,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            )
+            if (
+                {k: v.active for k, v in prior.components.items()}
+                != record.prior_active
+                or prior.components[PLATFORM].active is None
+                or current.components[PLATFORM].active != request.deployment_identity
+            ):
+                raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+            return self.services.recover_retained_redis_start(
+                request,
+                prior=prior.components[PLATFORM].active,
+                previous=prior.components[PLATFORM].previous,
+                journal=journal,
+            )
+
     def _recover_retained_redis(
         self, record: OperatorTransaction, *, restore: bool
     ) -> None:
@@ -4974,7 +5194,24 @@ class HostDeploymentActionController:
                 expected_owner_uid=self.root_uid,
                 expected_owner_gid=self.root_gid,
             )
-            self._transfer_retained_redis(record, prior_state=prior, restore=restore)
+            if "retained_redis_replacement_intent" in record.evidence:
+                if (
+                    restore
+                    or record.component != PLATFORM
+                    or record.candidate_active is None
+                ):
+                    raise fail(
+                        "OPERATOR_JOURNAL_INVALID", "Operator journal is invalid."
+                    )
+                self.services.verify_redis_replacement(
+                    record,
+                    prior=prior.components[PLATFORM].active,
+                    candidate=record.candidate_active[PLATFORM],
+                )
+            else:
+                self._transfer_retained_redis(
+                    record, prior_state=prior, restore=restore
+                )
 
     def _transfer_retained_redis(
         self,
@@ -5453,6 +5690,21 @@ class HostOperatorBackend:
                 "verified",
                 verification=_with_boundary_readiness(verification, boundary),
             )
+        if request.operation == START and request.unit == "helixweave-redis.service":
+            with self.journal_store.retained_redis_recovery(
+                task_identity=request.task_identity,
+                deployment_identity=request.deployment_identity,
+            ) as recovery:
+                if recovery is not None:
+                    with _operator_phase(
+                        "retained-redis-explicit-recovery", recovery.record
+                    ):
+                        service = (
+                            self.deployment_controller.recover_retained_redis_start(
+                                request, journal=recovery
+                            )
+                        )
+                    return OperatorOutcome("running", service=service)
         with self.journal_store.operation(
             operation=request.operation,
             task_identity=request.task_identity,

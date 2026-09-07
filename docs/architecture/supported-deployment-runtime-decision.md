@@ -235,6 +235,27 @@ restarting Redis or changing queue contents. Pre-PONR recovery restores the prio
 binding; post-PONR recovery finishes the candidate binding. Repeating the binding
 write is idempotent. Ordinary status remains read-only and rejects stale bindings.
 
+If that retained process has already stopped, ordinary reconciliation does not
+silently replace it. After checking for affected unfinished work and explicitly
+accepting loss of Redis volatile state, an operator may issue the existing fixed
+operator command as an authorized non-root operator:
+
+```text
+sudo -n /usr/libexec/helixweave-operator start helixweave-redis.service sha256-<journal-platform> task-<active-journal>
+```
+
+This exact task/candidate request opts into stopped-Redis recovery only for the
+active post-PONR Platform journal. Writers must be stopped, the original process
+must be absent, and candidate/configuration and full new process identity checks
+must pass. The journal keeps its original witness and separately checkpoints the
+replacement intent and identity. A retry reuses only the already verified new
+process; it never adopts an unknown replacement. The command leaves the original
+journal active; a subsequent normal deployment mutation performs its formal
+post-PONR reconciliation. It does not abort, restore SQLite, replay user jobs, or
+claim queue preservation across the prior stop. A still-live retained process
+continues through the unchanged lossless binding-transfer path. Acceptance
+cleanup must preserve journal-required dependencies until that journal closes.
+
 For a completed prerelease upgrade that left Redis bound to the previous Platform,
 use a new normal `helixweave upgrade --component platform --bundle /absolute/candidate.tar`
 or `helixweave rollback --component platform --identity sha256-<previous>`

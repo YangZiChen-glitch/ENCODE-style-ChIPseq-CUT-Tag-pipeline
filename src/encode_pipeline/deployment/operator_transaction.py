@@ -56,6 +56,8 @@ EVIDENCE_KEYS = frozenset(
     {
         "service_identity",
         "retained_redis_identity",
+        "retained_redis_replacement_intent",
+        "retained_redis_replacement_identity",
         "witness_identity",
         "action_receipt_identity",
         "database_prepare_receipt_identity",
@@ -699,7 +701,31 @@ class OperatorJournalHandle:
         self.record = record
         return record
 
-    def _copy_with_phase(self, phase: str) -> OperatorTransaction:
+    def record_redis_replacement(self, key: str, identity: str) -> None:
+        """Checkpoint explicit recovery without replacing the original witness."""
+        if (
+            self.record.phase != "recovery-required"
+            or not self.record.point_of_no_return
+            or key
+            not in {
+                "retained_redis_replacement_intent",
+                "retained_redis_replacement_identity",
+            }
+            or (key in self.record.evidence and self.record.evidence[key] != identity)
+        ):
+            raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+        if self.record.evidence.get(key) == identity:
+            return
+        record = self._copy_with_phase(
+            "recovery-required",
+            evidence={**self.record.evidence, key: _identity(identity)},
+        )
+        self._store._replace_active(record, expected_identity=self.record.identity)
+        self.record = record
+
+    def _copy_with_phase(
+        self, phase: str, *, evidence: Mapping[str, str] | None = None
+    ) -> OperatorTransaction:
         return OperatorTransaction.create(
             request_identity=self.record.request_identity,
             operation=self.record.operation,
@@ -710,7 +736,7 @@ class OperatorJournalHandle:
             phase=phase,
             failure_phase=(
                 self.record.phase
-                if phase == "recovery-required"
+                if phase == "recovery-required" and self.record.phase != phase
                 else self.record.failure_phase
             ),
             write_fence=self.record.write_fence,
@@ -729,7 +755,7 @@ class OperatorJournalHandle:
             schema_after_identity=self.record.schema_after_identity,
             schema_before_heads=self.record.schema_before_heads,
             target_schema_heads=self.record.target_schema_heads,
-            evidence=self.record.evidence,
+            evidence=self.record.evidence if evidence is None else evidence,
         )
 
 
@@ -825,6 +851,48 @@ class OperatorJournalStore:
                     "Operator transaction did not reach a terminal state.",
                     recoverable=True,
                 )
+        finally:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            finally:
+                os.close(lock)
+
+    @contextmanager
+    def retained_redis_recovery(
+        self, *, task_identity: str, deployment_identity: str
+    ) -> Iterator[OperatorJournalHandle | None]:
+        """Only an exact journal-task Redis START opts into volatile-state loss.
+
+        No reconciliation happens here: the original transaction remains active
+        until its ordinary post-PONR recovery completes.
+        """
+        directory, _history = self._directories(create=True)
+        lock = self._open_lock(self.layout.operator_transaction_lock, create=True)
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise fail(
+                    "OPERATOR_BUSY", "Another operator transaction is in progress."
+                ) from None
+            record = self._read_active(directory)
+            if record is None or record.task_identity != task_identity:
+                yield None
+                return
+            if (
+                record.phase != "recovery-required"
+                or not record.point_of_no_return
+                or record.operation not in {"activate", "rollback"}
+                or record.component != "platform"
+                or record.deployment_identity != deployment_identity
+                or "retained_redis_identity" not in record.evidence
+                or "helixweave-redis.service" in record.restart_units
+            ):
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Operator transaction requires recovery.",
+                )
+            yield OperatorJournalHandle(self, record)
         finally:
             try:
                 fcntl.flock(lock, fcntl.LOCK_UN)
@@ -949,6 +1017,7 @@ class OperatorJournalStore:
             or recovered.phase not in TERMINAL_PHASES | {"recovery-required"}
             or (prior.point_of_no_return and not recovered.point_of_no_return)
             or (prior.write_fence and not recovered.write_fence)
+            or any(recovered.evidence.get(k) != v for k, v in prior.evidence.items())
         ):
             raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
 
