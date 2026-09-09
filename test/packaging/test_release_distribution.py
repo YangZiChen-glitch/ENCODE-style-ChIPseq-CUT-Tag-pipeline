@@ -26,7 +26,7 @@ from encode_pipeline.services.workflow_builds import WorkflowBuildIdentityProvid
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RELEASE_VERSION = "0.4.0"
+RELEASE_VERSION = "0.4.1"
 EXPECTED_CONSOLE_SCRIPTS = {
     "encode-dag": "encode_pipeline.cli.dag:main",
     "encode-manifest": "encode_pipeline.cli.manifest:main",
@@ -245,6 +245,7 @@ def test_release_identity_is_consistent_across_public_metadata(
         assert citation["date-released"] == date(2026, 9, 9)
         assert "## [Unreleased]\n" in changelog
         assert f"## [{RELEASE_VERSION}] - 2026-09-09\n" in changelog
+        assert "## [0.4.0] - 2026-09-09\n" in changelog
     finally:
         app.state.run_queue.close()
         app.state.persistence.close()
@@ -379,28 +380,28 @@ def test_pep517_build_produces_bounded_wheel_and_sdist(tmp_path: Path) -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert {path.name for path in distribution_root.iterdir()} == {
-        "helixweave-0.4.0-py3-none-any.whl",
-        "helixweave-0.4.0.tar.gz",
+        "helixweave-0.4.1-py3-none-any.whl",
+        "helixweave-0.4.1.tar.gz",
     }
-    with tarfile.open(distribution_root / "helixweave-0.4.0.tar.gz", "r:gz") as archive:
+    with tarfile.open(distribution_root / "helixweave-0.4.1.tar.gz", "r:gz") as archive:
         names = archive.getnames()
-    assert "helixweave-0.4.0/README.md" in names
+    assert "helixweave-0.4.1/README.md" in names
     assert (
-        "helixweave-0.4.0/src/encode_pipeline/artifacts/artifact-inventory.yaml"
+        "helixweave-0.4.1/src/encode_pipeline/artifacts/artifact-inventory.yaml"
     ) in names
     assert (
-        "helixweave-0.4.0/src/encode_pipeline/contracts/deployment/"
+        "helixweave-0.4.1/src/encode_pipeline/contracts/deployment/"
         "deployment-bundle-v1.schema.json"
     ) in names
     assert (
-        "helixweave-0.4.0/src/encode_pipeline/deployment/templates/"
+        "helixweave-0.4.1/src/encode_pipeline/deployment/templates/"
         "helixweave-api.service.in"
     ) in names
     assert (
-        "helixweave-0.4.0/src/encode_pipeline/frontend_assets/asset-manifest.json"
+        "helixweave-0.4.1/src/encode_pipeline/frontend_assets/asset-manifest.json"
     ) in names
-    assert ("helixweave-0.4.0/scripts/bootstrap_helixweave_operator.py") in names
-    assert not any(name.startswith("helixweave-0.4.0/test/") for name in names)
+    assert ("helixweave-0.4.1/scripts/bootstrap_helixweave_operator.py") in names
+    assert not any(name.startswith("helixweave-0.4.1/test/") for name in names)
 
 
 def test_sdist_contains_the_exact_encode_runtime_source_manifest(
@@ -466,7 +467,7 @@ def test_sdist_bootstrap_asset_is_self_contained_outside_a_checkout(
     extracted = tmp_path / "extracted"
     with tarfile.open(sdist, "r:gz") as archive:
         archive.extractall(extracted, filter="data")
-    release_root = extracted / "helixweave-0.4.0"
+    release_root = extracted / "helixweave-0.4.1"
     host_root = tmp_path / "host"
     host_root.mkdir()
     outside = tmp_path / "outside"
@@ -553,7 +554,7 @@ app = create_app(
 try:
     schema = app.openapi()
     assert schema["info"]["title"] == "HelixWeave API"
-    assert schema["info"]["version"] == "0.4.0"
+    assert schema["info"]["version"] == "0.4.1"
     assert "/api/v1/workflows/" in schema["paths"]
 finally:
     app.state.run_queue.close()

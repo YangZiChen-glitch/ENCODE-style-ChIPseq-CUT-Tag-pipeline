@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-09
+
+### Fixed
+
+- Make frontend CommonJS generation independent of module loading order by
+  preserving require-time initialization. Add a focused loading-order regression
+  and regenerate the packaged frontend with the locked toolchain.
+- This patch addresses build determinism; it does not indicate that the published
+  v0.4.0 installation packages were corrupt. Scientific workflows, dependency
+  versions, database schema, and deployment support boundaries are unchanged.
+
 ## [0.4.0] - 2026-09-09
 
 ### Added
