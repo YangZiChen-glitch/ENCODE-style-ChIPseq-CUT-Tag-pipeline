@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from email.parser import Parser
 import json
 import os
@@ -241,9 +242,9 @@ def test_release_identity_is_consistent_across_public_metadata(
         assert frontend_lock["packages"][""]["version"] == RELEASE_VERSION
         assert citation["title"] == "HelixWeave"
         assert citation["version"] == RELEASE_VERSION
-        assert "date-released" not in citation
+        assert citation["date-released"] == date(2026, 9, 9)
         assert "## [Unreleased]\n" in changelog
-        assert f"## [{RELEASE_VERSION}]" not in changelog
+        assert f"## [{RELEASE_VERSION}] - 2026-09-09\n" in changelog
     finally:
         app.state.run_queue.close()
         app.state.persistence.close()
