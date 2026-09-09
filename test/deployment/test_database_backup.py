@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -30,6 +32,7 @@ from encode_pipeline.deployment.database import (
     database_path_identity,
     fresh_database_candidate_path,
     inspect_database,
+    observe_online_database,
     publish_fresh_database,
     quarantine_invalid_fresh_database,
     quarantine_fresh_database,
@@ -275,6 +278,157 @@ def test_inspection_uses_one_pinned_immutable_fd_and_dynamic_schema_head(
     assert len(observed_uris) == 1
     assert observed_uris[0].startswith("file:/proc/self/fd/")
     assert "mode=ro&immutable=1" in observed_uris[0]
+
+
+def test_online_observation_reads_committed_wal_without_offline_claims(
+    tmp_path: Path,
+) -> None:
+    layout = _ready_layout(tmp_path)
+    before = _inspect_database(layout.database)
+    connection = sqlite3.connect(layout.database)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        main_before = layout.database.read_bytes()
+        connection.execute(
+            "UPDATE alembic_version SET version_num = ?", (FAILED_SCHEMA_HEAD,)
+        )
+        connection.commit()
+        assert layout.database.read_bytes() == main_before
+        assert Path(f"{layout.database}-wal").stat().st_size > 0
+        assert Path(f"{layout.database}-shm").stat().st_size > 0
+        online = observe_online_database(
+            layout.database,
+            expected_owner_uid=os.getuid(),
+            expected_owner_gid=os.getgid(),
+        )
+        assert online.schema_heads == (FAILED_SCHEMA_HEAD,)
+        assert online.identity != database_content_identity(before)
+        assert not hasattr(online, "sha256") and not hasattr(online, "size_bytes")
+        assert layout.database.read_bytes() == main_before
+        with pytest.raises(DeploymentError, match="DATABASE_SIDECAR_NOT_QUIESCENT"):
+            _inspect_database(layout.database)
+    finally:
+        connection.close()
+    # No leaked reader keeps an otherwise clean WAL/SHM alive.
+    assert not Path(f"{layout.database}-shm").exists()
+
+
+@pytest.mark.parametrize("fault", ("invalid", "unreadable", "symlink", "replacement"))
+def test_online_observation_rejects_invalid_or_changed_database(
+    tmp_path: Path, monkeypatch, fault: str
+) -> None:
+    layout = _ready_layout(tmp_path)
+    if fault == "invalid":
+        layout.database.write_bytes(b"not a SQLite database")
+    elif fault == "unreadable":
+        layout.database.chmod(0o000)
+    elif fault == "symlink":
+        target = layout.database.with_suffix(".target")
+        layout.database.rename(target)
+        layout.database.symlink_to(target)
+    else:
+        original = database_module.subprocess.run
+
+        def replace_after_read(*args, **kwargs):
+            result = original(*args, **kwargs)
+            replacement = layout.database.with_suffix(".replacement")
+            replacement.write_bytes(layout.database.read_bytes())
+            replacement.replace(layout.database)
+            return result
+
+        monkeypatch.setattr(database_module.subprocess, "run", replace_after_read)
+    with pytest.raises(DeploymentError):
+        observe_online_database(
+            layout.database,
+            expected_owner_uid=os.getuid(),
+            expected_owner_gid=os.getgid(),
+        )
+
+
+@pytest.mark.parametrize("raises", (False, True))
+def test_online_query_always_closes_connection(monkeypatch, raises: bool) -> None:
+    calls = []
+
+    class Connection:
+        def setlimit(self, *args):
+            pass
+
+        def set_progress_handler(self, *args):
+            pass
+
+        def execute(self, statement):
+            calls.append(statement)
+            if statement.startswith("SELECT") and raises:
+                raise sqlite3.DatabaseError("private input")
+            return self
+
+        def fetchall(self):
+            return [(SCHEMA_HEAD,)]
+
+        def close(self):
+            calls.append("close")
+
+    def connect(database, **kwargs):
+        assert database == "file:/fixed/database?mode=ro" and kwargs == {
+            "uri": True,
+            "timeout": 1.0,
+        }
+        return Connection()
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(sys, "argv", ["query", "file:/fixed/database?mode=ro"])
+    if raises:
+        with pytest.raises(sqlite3.DatabaseError):
+            exec(database_module._ONLINE_SCHEMA_QUERY, {})
+    else:
+        exec(database_module._ONLINE_SCHEMA_QUERY, {})
+    assert calls[-1] == "close"
+    assert calls[0] == "PRAGMA query_only = ON"
+
+
+def test_online_reader_drops_root_and_bounds_query_without_freezing_mtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    layout = _ready_layout(tmp_path)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(kwargs)
+        assert argv[:4] == ["/usr/bin/python3", "-I", "-B", "-c"]
+        assert argv[-1].endswith("?mode=ro")
+        assert "immutable" not in argv[-1] and "nolock" not in argv[-1]
+        assert kwargs["user"] == os.getuid() and kwargs["group"] == os.getgid()
+        assert kwargs["extra_groups"] == [] and kwargs["timeout"] == 3.0
+        assert kwargs["umask"] == 0o007
+        fd = kwargs["pass_fds"][0]
+        assert stat.S_ISDIR(os.fstat(fd).st_mode)
+        os.utime(layout.database, None)  # A writer's timestamps are not immutable.
+        return subprocess.CompletedProcess(
+            argv, 0, ('["' + SCHEMA_HEAD + '"]').encode()
+        )
+
+    monkeypatch.setattr(database_module.subprocess, "run", run)
+    assert observe_online_database(
+        layout.database, expected_owner_uid=os.getuid(), expected_owner_gid=os.getgid()
+    ).schema_heads == (SCHEMA_HEAD,)
+    with pytest.raises(OSError):
+        os.fstat(calls[0]["pass_fds"][0])
+
+    def timeout(*args, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired("fixed query", 3.0)
+
+    monkeypatch.setattr(database_module.subprocess, "run", timeout)
+    with pytest.raises(DeploymentError, match="DATABASE_UNAVAILABLE"):
+        observe_online_database(
+            layout.database,
+            expected_owner_uid=os.getuid(),
+            expected_owner_gid=os.getgid(),
+        )
+    with pytest.raises(OSError):
+        os.fstat(calls[-1]["pass_fds"][0])
 
 
 @pytest.mark.parametrize("suffix", ("-wal", "-shm", "-journal"))

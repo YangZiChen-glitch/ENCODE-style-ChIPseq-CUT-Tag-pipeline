@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import encode_pipeline.deployment.backend as backend_module
+import encode_pipeline.deployment.operator as operator_module
 from encode_pipeline.deployment.admission import (
     DeferredDatabaseSchemaObserver,
     DeferredNativeContractResolver,
@@ -37,6 +38,7 @@ from encode_pipeline.deployment.operator_action import (
     DeploymentActionReceipt,
     ReadinessCheck,
 )
+from encode_pipeline.deployment.state import StateStore
 from .support import manager_for, manifest_for, write_bundle
 
 
@@ -192,7 +194,13 @@ def test_operator_client_rejects_extra_or_mismatched_receipt_fields() -> None:
 def test_operator_client_fails_closed_on_untrusted_execution_results(
     failure: str,
     recoverable: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+
     def run(_arguments: tuple[str, ...]) -> object:
         if failure == "exception":
             raise OSError("/private/operator token=secret")
@@ -228,6 +236,23 @@ def test_operator_client_fails_closed_on_untrusted_execution_results(
     assert caught.value.issue.recoverable is recoverable
     assert "private" not in str(caught.value)
     assert "secret" not in str(caught.value)
+    diagnostic = json.loads(logs[-1].split(" ", 1)[1])
+    assert diagnostic["task_identity"] == TASK
+    assert (
+        diagnostic["code"]
+        == {
+            "exception": "EXECUTION_EXCEPTION",
+            "wrong-type": "EXECUTION_TYPE_INVALID",
+            "exit-unavailable": "EXIT_NONZERO",
+            "stderr": "STDERR_PRESENT",
+            "empty": "RECEIPT_SIZE_INVALID",
+            "oversized": "RECEIPT_SIZE_INVALID",
+            "invalid-json": "JSON_INVALID",
+            "duplicate-key": "JSON_INVALID",
+            "noncanonical": "CANONICAL_RECEIPT_INVALID",
+        }[failure]
+    )
+    assert "private" not in "".join(logs) and "secret" not in "".join(logs)
 
 
 def test_operator_client_accepts_stopped_services_and_exact_mutation_receipts() -> None:
@@ -311,7 +336,11 @@ def test_operator_service_observation_rejects_invalid_unit_and_identity_evidence
         assert caught.value.issue.code == "DEPLOYMENT_OPERATOR_UNAVAILABLE"
 
 
-def test_operator_observation_uses_the_fixed_state_bound_grammar() -> None:
+def test_operator_observation_uses_the_fixed_state_bound_grammar(monkeypatch) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
     observation = OperatorObservation.create(
         state_identity=IDENTITY,
         active={
@@ -344,6 +373,13 @@ def test_operator_observation_uses_the_fixed_state_bound_grammar() -> None:
 
     assert result == observation
     assert calls == [("observe", IDENTITY, TASK)]
+    assert [
+        (d["phase"], d["code"])
+        for d in (json.loads(line.split(" ", 1)[1]) for line in logs)
+    ] == [
+        ("operator-parse", "OK"),
+        ("operator-receipt", "OK"),
+    ]
 
 
 def test_operator_observation_preserves_headless_database_identity() -> None:
@@ -487,7 +523,61 @@ def test_supported_composition_separates_state_reader_group_from_release_owner(
     )
 
 
-def test_ingress_publication_is_flat_atomic_and_reusable(tmp_path: Path) -> None:
+def test_ingress_publication_is_flat_atomic_durable_and_reusable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manifest, payload = manifest_for(PLATFORM)
+    source = write_bundle(tmp_path / "source.tar", manifest, payload)
+    component_directory = layout.ingress / PLATFORM
+    component_directory.mkdir(parents=True)
+    component_directory.chmod(0o2770)
+    publisher = IngressPublisher(
+        layout,
+        directory_uid=os.getuid(),
+        directory_gid=os.getgid(),
+        file_uid=os.getuid(),
+    )
+    fsync_targets: list[str] = []
+    links: list[tuple[str, str, bool]] = []
+    real_fsync = os.fsync
+    real_link = os.link
+
+    def recording_fsync(descriptor: int) -> None:
+        observed = os.fstat(descriptor)
+        fsync_targets.append("directory" if stat.S_ISDIR(observed.st_mode) else "file")
+        real_fsync(descriptor)
+
+    def recording_link(source_name: str, target_name: str, **kwargs) -> None:
+        links.append((source_name, target_name, kwargs.get("follow_symlinks", True)))
+        real_link(source_name, target_name, **kwargs)
+
+    monkeypatch.setattr(backend_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(backend_module.os, "link", recording_link)
+
+    published = publisher.publish(source, manifest, TASK)
+    same = publisher.publish(source, manifest, TASK)
+
+    assert published == component_directory / f"{manifest.identity}.tar"
+    assert same == published
+    observed = published.lstat()
+    assert stat.S_ISREG(observed.st_mode)
+    assert observed.st_nlink == 1
+    assert stat.S_IMODE(observed.st_mode) == 0o440
+    assert not tuple(component_directory.glob("*.partial"))
+    assert fsync_targets == ["file", "directory"]
+    assert links == [
+        (
+            f".{manifest.identity}.{TASK}.partial",
+            f"{manifest.identity}.tar",
+            False,
+        )
+    ]
+
+
+def test_ingress_publication_rejects_legacy_write_only_group_mode(
+    tmp_path: Path,
+) -> None:
     layout = DeploymentLayout.isolated(tmp_path / "host")
     manifest, payload = manifest_for(PLATFORM)
     source = write_bundle(tmp_path / "source.tar", manifest, payload)
@@ -501,16 +591,104 @@ def test_ingress_publication_is_flat_atomic_and_reusable(tmp_path: Path) -> None
         file_uid=os.getuid(),
     )
 
-    published = publisher.publish(source, manifest, TASK)
-    same = publisher.publish(source, manifest, TASK)
+    with pytest.raises(DeploymentError) as captured:
+        publisher.publish(source, manifest, TASK)
 
-    assert published == component_directory / f"{manifest.identity}.tar"
-    assert same == published
-    observed = published.lstat()
-    assert stat.S_ISREG(observed.st_mode)
-    assert observed.st_nlink == 1
-    assert stat.S_IMODE(observed.st_mode) == 0o440
-    assert not tuple(component_directory.glob("*.partial"))
+    assert captured.value.issue.code == "DEPLOYMENT_INGRESS_UNAVAILABLE"
+    assert not tuple(component_directory.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("directory_uid", "directory_gid"),
+    ((os.getuid() + 1, os.getgid()), (os.getuid(), os.getgid() + 1)),
+)
+def test_ingress_publication_rejects_wrong_boundary_owner_or_group(
+    tmp_path: Path,
+    directory_uid: int,
+    directory_gid: int,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manifest, payload = manifest_for(PLATFORM)
+    source = write_bundle(tmp_path / "source.tar", manifest, payload)
+    component_directory = layout.ingress / PLATFORM
+    component_directory.mkdir(parents=True)
+    component_directory.chmod(0o2770)
+    publisher = IngressPublisher(
+        layout,
+        directory_uid=directory_uid,
+        directory_gid=directory_gid,
+        file_uid=os.getuid(),
+    )
+
+    with pytest.raises(DeploymentError) as captured:
+        publisher.publish(source, manifest, TASK)
+
+    assert captured.value.issue.code == "DEPLOYMENT_INGRESS_UNAVAILABLE"
+    assert not tuple(component_directory.iterdir())
+
+
+def test_ingress_publication_rejects_directory_inode_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manifest, payload = manifest_for(PLATFORM)
+    source = write_bundle(tmp_path / "source.tar", manifest, payload)
+    component_directory = layout.ingress / PLATFORM
+    component_directory.mkdir(parents=True)
+    component_directory.chmod(0o2770)
+    publisher = IngressPublisher(
+        layout,
+        directory_uid=os.getuid(),
+        directory_gid=os.getgid(),
+        file_uid=os.getuid(),
+    )
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if Path(path) == component_directory and dir_fd is None and not swapped:
+            original = component_directory.with_name(f"{PLATFORM}-original")
+            component_directory.rename(original)
+            component_directory.mkdir()
+            component_directory.chmod(0o2770)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(backend_module.os, "open", swapping_open)
+
+    with pytest.raises(DeploymentError) as captured:
+        publisher.publish(source, manifest, TASK)
+
+    assert captured.value.issue.code == "DEPLOYMENT_INGRESS_UNAVAILABLE"
+    assert swapped is True
+    assert not tuple(component_directory.iterdir())
+
+
+def test_ingress_publication_rejects_symlinked_component_directory(
+    tmp_path: Path,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manifest, payload = manifest_for(PLATFORM)
+    source = write_bundle(tmp_path / "source.tar", manifest, payload)
+    layout.ingress.mkdir(parents=True)
+    real_directory = tmp_path / "real-ingress"
+    real_directory.mkdir()
+    real_directory.chmod(0o2770)
+    component_directory = layout.ingress / PLATFORM
+    component_directory.symlink_to(real_directory, target_is_directory=True)
+    publisher = IngressPublisher(
+        layout,
+        directory_uid=os.getuid(),
+        directory_gid=os.getgid(),
+        file_uid=os.getuid(),
+    )
+
+    with pytest.raises(DeploymentError) as captured:
+        publisher.publish(source, manifest, TASK)
+
+    assert captured.value.issue.code == "DEPLOYMENT_INGRESS_UNAVAILABLE"
+    assert not tuple(real_directory.iterdir())
 
 
 @dataclass
@@ -590,6 +768,56 @@ class _Operator:
         frontend_identity = backend_module._frontend_identity(status)
         assert frontend_identity is not None
         return _verification(frontend_identity=frontend_identity)
+
+
+@pytest.mark.parametrize("changed_field", ["state_identity", "active"])
+def test_observation_binding_diagnostic_names_only_the_mismatched_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_field: str
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manager = manager_for(layout)
+    manifest, payload = manifest_for(PLATFORM)
+    bundle = write_bundle(tmp_path / "platform.tar", manifest, payload)
+    manager.stage(bundle)
+    operator = _Operator(manager, bundle)
+    original = operator.observe(manager.status().state.identity, TASK)
+    mismatched = OperatorObservation.create(
+        state_identity=(
+            OTHER_IDENTITY
+            if changed_field == "state_identity"
+            else original.state_identity
+        ),
+        active=(
+            {**original.active, PLATFORM: OTHER_IDENTITY}
+            if changed_field == "active"
+            else original.active
+        ),
+        database_schema_identity=original.database_schema_identity,
+        database_schema_heads=original.database_schema_heads,
+        services=original.services,
+    )
+    monkeypatch.setattr(operator, "observe", lambda *_: mismatched)
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    backend = ProductionCommandBackend(
+        layout=layout,
+        manager=manager,
+        operator=operator,
+        ingress=_Ingress([]),
+        task_factory=lambda: TASK,
+    )
+    before = manager.status().state.identity
+    assert backend._operator_observation(manager.status()) is None
+    assert manager.status().state.identity == before
+    assert json.loads(logs[-1].split(" ", 1)[1]) == {
+        "phase": "state-binding",
+        "code": "BINDING_MISMATCH",
+        "task_identity": TASK,
+        "differing_fields": [changed_field],
+    }
+    assert OTHER_IDENTITY not in logs[-1]
 
 
 def test_upgrade_composes_ingress_operator_and_root_state_reread(
@@ -710,9 +938,11 @@ def test_rollback_requires_and_activates_the_exact_previous_identity(
     assert operator.calls == [("rollback", PLATFORM, previous.identity, TASK)]
 
 
+@pytest.mark.parametrize("schema_matches", (True, False))
 def test_status_uses_root_observation_when_the_local_database_is_unreadable(
     tmp_path: Path,
     monkeypatch,
+    schema_matches: bool,
 ) -> None:
     layout = DeploymentLayout.isolated(tmp_path / "host")
     manager = manager_for(layout)
@@ -729,6 +959,20 @@ def test_status_uses_root_observation_when_the_local_database_is_unreadable(
 
     monkeypatch.setattr(manager, "observe_database_schema", unavailable)
     operator = _Operator(manager, bundle)
+    if not schema_matches:
+        observed = operator.observe(manager.status().state.identity, TASK)
+        monkeypatch.setattr(
+            operator,
+            "observe",
+            lambda *_: OperatorObservation.create(
+                state_identity=observed.state_identity,
+                active=observed.active,
+                # The root operator withholds schema evidence on incompatibility.
+                database_schema_identity=None,
+                database_schema_heads=(),
+                services=observed.services,
+            ),
+        )
     backend = ProductionCommandBackend(
         layout=layout,
         manager=manager,
@@ -740,8 +984,12 @@ def test_status_uses_root_observation_when_the_local_database_is_unreadable(
     result = backend.status()
 
     assert result.value["schema_version"] == STATUS_RESULT_SCHEMA
-    assert result.value["database_schema_identity"] == OTHER_IDENTITY
-    assert result.value["database_schema_reason_code"] == "DATABASE_READY"
+    assert result.value["database_schema_identity"] == (
+        OTHER_IDENTITY if schema_matches else None
+    )
+    assert result.value["database_schema_reason_code"] == (
+        "DATABASE_READY" if schema_matches else "DATABASE_UNAVAILABLE"
+    )
 
 
 def test_status_fails_closed_instead_of_zeroing_unknown_operator_counts(
@@ -877,6 +1125,89 @@ def test_verify_and_doctor_consume_the_same_root_schema_observation(
         "reason_code": "DATABASE_READY",
         "evidence_identity": OTHER_IDENTITY,
     }
+
+
+@pytest.mark.parametrize(
+    "evidence", ["bound", "incompatible", "missing", "state", "active"]
+)
+def test_production_deferred_backend_projects_only_bound_root_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    setup = manager_for(layout)
+    setup.states = StateStore(layout, reader_gid=os.getgid(), service_gid=os.getgid())
+    manifest, payload = manifest_for(PLATFORM)
+    bundle = write_bundle(tmp_path / "platform.tar", manifest, payload)
+    setup.stage(bundle)
+    setup.activate(PLATFORM, expected_staged_identity=manifest.identity)
+    operator = _Operator(setup, bundle)
+    original = operator.observe(setup.status().state.identity, TASK)
+    raw = original.to_dict()
+    if evidence == "incompatible":
+        raw.update(database_schema_identity=None, database_schema_heads=[])
+    elif evidence == "state":
+        raw["state_identity"] = OTHER_IDENTITY
+    elif evidence == "active":
+        raw["active"] = {**original.active, PLATFORM: OTHER_IDENTITY}
+    observed = OperatorObservation.create(
+        state_identity=raw["state_identity"],
+        active=raw["active"],
+        database_schema_identity=raw["database_schema_identity"],
+        database_schema_heads=raw["database_schema_heads"],
+        services=raw["services"],
+    )
+
+    def observe(*_):
+        if evidence == "missing":
+            raise fail("OPERATOR_OBSERVATION_UNAVAILABLE", "Observation unavailable.")
+        return observed
+
+    monkeypatch.setattr(operator, "observe", observe)
+    monkeypatch.setattr(
+        backend_module.DeploymentLayout, "supported", classmethod(lambda cls: layout)
+    )
+    monkeypatch.setattr(
+        backend_module.DeploymentOwnership,
+        "root",
+        classmethod(lambda cls: setup.ownership),
+    )
+    monkeypatch.setattr(backend_module, "_operator_group_gid", os.getgid)
+    monkeypatch.setattr(backend_module, "_fixed_group_gid", lambda _: os.getgid())
+    monkeypatch.setattr(backend_module, "SudoOperatorClient", lambda: operator)
+    backend = ProductionCommandBackend.supported()
+    assert isinstance(backend.manager.contract_resolver, DeferredNativeContractResolver)
+    assert isinstance(backend.manager.schema_observer, DeferredDatabaseSchemaObserver)
+
+    ready = evidence == "bound"
+    if evidence in {"missing", "state", "active"}:
+        with pytest.raises(DeploymentError, match="OPERATOR_OBSERVATION_UNAVAILABLE"):
+            backend.status()
+    else:
+        status = backend.status().value
+        assert (status["database_schema_reason_code"] == "DATABASE_READY") is ready
+    database = next(
+        c for c in backend.doctor().value["checks"] if c["check_id"] == "database"
+    )
+    assert (database["reason_code"] == "DATABASE_READY") is ready
+    if evidence in {"missing", "state", "active"}:
+        with pytest.raises(DeploymentError, match="OPERATOR_OBSERVATION_UNAVAILABLE"):
+            backend.verify()
+    else:
+        result = backend.verify().value
+        assert result["verified"] is ready
+        assert (result["database_schema_identity"] is not None) is ready
+        if ready:
+            # A later storage snapshot cannot borrow an earlier native result.
+            current = backend.manager.verify_storage()
+            changed = replace(
+                current, state=current.state.stage(PLATFORM, OTHER_IDENTITY)
+            )
+            monkeypatch.setattr(backend.manager, "verify_storage", lambda: changed)
+            result = backend.verify().value
+            assert result["verified"] is False
+            assert result["database_schema_identity"] is None
 
 
 def test_verify_rejects_native_evidence_nullability_that_does_not_match_state(

@@ -8,6 +8,7 @@ import {
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { RunResponse } from '../src/api/generated/models/runResponse';
 
 interface RuntimeManifest {
   bulkWorkflowId: string;
@@ -41,6 +42,22 @@ async function expectNoHorizontalOverflow(page: Page) {
       ),
     )
     .toBe(true);
+}
+
+async function expectFullIdentity(
+  container: Locator,
+  label: string,
+  identity: string,
+) {
+  // IdWithCopy abbreviates visible text; its title and accessible name retain
+  // the complete API identity, not merely a shared prefix.
+  await expect(container.getByTitle(identity, { exact: true })).toBeVisible();
+  await expect(
+    container.getByRole('button', {
+      name: `Copy full ${label} ${identity}`,
+      exact: true,
+    }),
+  ).toBeVisible();
 }
 
 async function capture(page: Page, testInfo: TestInfo, name: string) {
@@ -482,6 +499,10 @@ test('Bulk RNA-seq product path is fail-closed or executes by declared admission
       page.getByText(/No enabled reference profile is available for this workflow/i),
     ).toBeVisible();
   }
+  const selectedReferenceRevision =
+    fixture.bulkExpectedExecution === 'available'
+      ? await referenceSelector.inputValue()
+      : null;
 
   const configForm = page.getByLabel('Workflow config form');
   await expect(configForm).toContainText('Standard bulk RNA-seq parameters');
@@ -594,6 +615,9 @@ test('Bulk RNA-seq product path is fail-closed or executes by declared admission
   expect(requestPayload.reference_profile_revision_id).toMatch(
     /^refpr_[0-9a-f]{32}$/,
   );
+  expect(requestPayload.reference_profile_revision_id).toBe(
+    selectedReferenceRevision,
+  );
 
   const validation = (await validateResponse.json()) as {
     ok: boolean;
@@ -656,10 +680,37 @@ test('Bulk RNA-seq product path is fail-closed or executes by declared admission
     timeout: 40 * 60 * 1_000,
   });
   await expect(page).toHaveURL(`/runs/${runId}`);
+  const runResponse = await page.request.get(`/api/v1/runs/${runId}`);
+  expect(runResponse.status()).toBe(200);
+  const runBody = (await runResponse.json()) as RunResponse;
+  expect(runBody.ok).toBe(true);
+  expect(runBody.run?.run_id).toBe(runId);
+  const reference = runBody.run?.reference_profile;
+  expect(reference).toMatchObject({
+    revision_id: selectedReferenceRevision,
+    revision_number: 1,
+    display_name: 'Bulk RNA-seq browser tiny',
+    organism: 'Synthetic organism',
+    assembly: 'tiny',
+  });
+  expect(reference!.identity_sha256).toMatch(/^[0-9a-f]{64}$/);
   const referenceEvidence = page.getByTestId('run-reference-profile');
-  await expect(referenceEvidence).toContainText('Bulk RNA-seq browser tiny');
-  await expect(referenceEvidence).toContainText('Synthetic organism · tiny');
-  await expect(referenceEvidence).toContainText(/Revision 1 · [0-9a-f]{64}/);
+  for (const [label, value] of [
+    ['Reference', reference!.display_name],
+    ['Organism / assembly', `${reference!.organism} · ${reference!.assembly}`],
+    ['Revision', String(reference!.revision_number)],
+  ]) {
+    await expect(
+      referenceEvidence
+        .getByText(label, { exact: true })
+        .locator('xpath=following-sibling::dd[1]'),
+    ).toHaveText(value);
+  }
+  await expectFullIdentity(
+    referenceEvidence,
+    'reference identity digest',
+    reference!.identity_sha256,
+  );
   await captureElement(
     page,
     page.getByTestId('run-status-badge').locator('..'),
@@ -861,20 +912,28 @@ test('Bulk RNA-seq product path is fail-closed or executes by declared admission
     ).toBeDefined();
     const row = qcTable
       .getByRole('row')
-      .filter({ hasText: metricKey })
-      .filter({ hasText: sampleId });
+      .filter({ has: page.getByTitle(metricKey, { exact: true }) })
+      .filter({ hasText: sampleId })
+      .filter({
+        has: page.getByTitle(metric!.source_artifact_id, { exact: true }),
+      });
+    await expect(row).toHaveCount(1);
     await expect(
-      row.first(),
+      row,
       `QC UI omitted ${sampleId}/${metricKey}`,
     ).toBeVisible();
-    await expect(row.first().getByText(value, { exact: true })).toBeVisible();
-    await expect(row.first()).toContainText(metric!.source_artifact_id);
+    await expect(row.getByTitle(value, { exact: true })).toHaveText(value);
+    await expect(row.getByText(metric!.unit, { exact: true })).toBeVisible();
+    await expectFullIdentity(row, 'source artifact ID', metric!.source_artifact_id);
   }
   const firstMetric = metrics[0]!;
   let firstMetricRows = qcTable
     .getByRole('row')
-    .filter({ hasText: firstMetric.metric_key })
-    .filter({ hasText: firstMetric.scope });
+    .filter({ has: page.getByTitle(firstMetric.metric_key, { exact: true }) })
+    .filter({ hasText: firstMetric.scope })
+    .filter({
+      has: page.getByTitle(firstMetric.source_artifact_id, { exact: true }),
+    });
   for (const ownerId of [
     firstMetric.sample_id,
     firstMetric.experiment_id,
@@ -883,10 +942,14 @@ test('Bulk RNA-seq product path is fail-closed or executes by declared admission
   }
   await expect(firstMetricRows).toHaveCount(1);
   const firstMetricRow = firstMetricRows.first();
-  await expect(firstMetricRow).toContainText(firstMetric.source_artifact_id);
+  await expectFullIdentity(
+    firstMetricRow,
+    'source artifact ID',
+    firstMetric.source_artifact_id,
+  );
   const firstMetricValueUnitCell = firstMetricRow.getByRole('cell').nth(1);
   await expect(
-    firstMetricValueUnitCell.getByTitle(firstMetric.value),
+    firstMetricValueUnitCell.getByTitle(firstMetric.value, { exact: true }),
   ).toHaveText(firstMetric.value);
   await expect(
     firstMetricValueUnitCell.getByText(firstMetric.unit, { exact: true }),
@@ -983,11 +1046,25 @@ test('Bulk RNA-seq product path is fail-closed or executes by declared admission
   const mobileQcCard = qcMobileList
     .getByRole('listitem')
     .filter({ hasText: mobileQcSampleId })
-    .filter({ hasText: mobileQcMetricKey })
-    .filter({ hasText: mobileQcValue })
-    .filter({ hasText: mobileQcMetric!.source_artifact_id })
-    .first();
+    .filter({ has: page.getByTitle(mobileQcMetricKey, { exact: true }) })
+    .filter({ has: page.getByTitle(mobileQcValue, { exact: true }) })
+    .filter({
+      has: page.getByTitle(mobileQcMetric!.source_artifact_id, { exact: true }),
+    });
+  await expect(mobileQcCard).toHaveCount(1);
   await expect(mobileQcCard).toBeVisible();
+  await expect(
+    mobileQcCard.getByTitle(mobileQcValue, { exact: true }),
+  ).toHaveText(mobileQcValue);
+  await expect(
+    mobileQcCard.getByText(mobileQcMetric!.unit, { exact: true }),
+  ).toBeVisible();
+  await mobileQcCard.getByText('Technical metadata', { exact: true }).click();
+  await expectFullIdentity(
+    mobileQcCard,
+    'source artifact ID',
+    mobileQcMetric!.source_artifact_id,
+  );
   const openMobileQcSource = mobileQcCard.getByRole('button', {
     name: `Open source artifact for ${mobileQcMetric!.display_name}`,
   });

@@ -31,13 +31,19 @@ with systemd enabled:
   producer expands a hash-locked, wheel-only CPython 3.12/Linux x86_64
   dependency closure before bundling it;
 - the ENCODE Snakemake closure is an independently versioned immutable runtime
-  containing the workflow source, a static micromamba frontend, and every
+  containing the workflow source, a pinned Linux x86_64 micromamba frontend
+  admitted against the supported glibc loader, and every
   package archive named by the checked-in explicit environment locks;
 - the bulk RNA-seq source, Nextflow, JDK, plugin, and container closure remains
   governed by the existing pinned runtime contract and uses a dedicated
   rootless Docker daemon/socket owned by the service account; and
 - SQLite remains the canonical lifecycle and result-metadata store. Redis/RQ
   remains a queue boundary only.
+
+The v0.4.0 supported Ubuntu host coordinate binds `util-linux`
+`2.39.3-9ubuntu6.6` and the exact qualified `/usr/bin/unshare` bytes. Operators
+must not downgrade the system package or substitute a temporary executable to
+meet that coordinate.
 
 References are prepared outside HelixWeave by an administrator and registered
 through the existing private configuration/CLI contracts. Deployment code
@@ -220,6 +226,45 @@ the active platform does not admit is rejected. Previous content, runtime
 closures, evidence, and backups are retained until an explicit future
 retention action; this milestone provides no automatic pruning.
 
+Platform upgrade and rollback retain a running dedicated Redis process. Before
+transferring its saved deployment binding, the operator verifies the complete
+saved process/socket identity and requires both candidates' indexed Redis
+configuration and unit bytes to match the installed fixed boundary. It journals
+the retained identity before switching state, then atomically rebinds it without
+restarting Redis or changing queue contents. Pre-PONR recovery restores the prior
+binding; post-PONR recovery finishes the candidate binding. Repeating the binding
+write is idempotent. Ordinary status remains read-only and rejects stale bindings.
+
+If that retained process has already stopped, ordinary reconciliation does not
+silently replace it. After checking for affected unfinished work and explicitly
+accepting loss of Redis volatile state, an operator may issue the existing fixed
+operator command as an authorized non-root operator:
+
+```text
+sudo -n /usr/libexec/helixweave-operator start helixweave-redis.service sha256-<journal-platform> task-<active-journal>
+```
+
+This exact task/candidate request opts into stopped-Redis recovery only for the
+active post-PONR Platform journal. Writers must be stopped, the original process
+must be absent, and candidate/configuration and full new process identity checks
+must pass. The journal keeps its original witness and separately checkpoints the
+replacement intent and identity. A retry reuses only the already verified new
+process; it never adopts an unknown replacement. The command leaves the original
+journal active; a subsequent normal deployment mutation performs its formal
+post-PONR reconciliation. It does not abort, restore SQLite, replay user jobs, or
+claim queue preservation across the prior stop. A still-live retained process
+continues through the unchanged lossless binding-transfer path. Acceptance
+cleanup must preserve journal-required dependencies until that journal closes.
+
+For a completed prerelease upgrade that left Redis bound to the previous Platform,
+use a new normal `helixweave upgrade --component platform --bundle /absolute/candidate.tar`
+or `helixweave rollback --component platform --identity sha256-<previous>`
+transaction with the corrected operator. Only a
+saved identity belonging to the current state's known prior slot and matching the
+actual process and compatible configuration is eligible. The new transaction
+records the transfer; completed history is neither reopened nor rewritten. Unknown
+processes and incompatible configurations remain fail-closed.
+
 An ENCODE runtime is materialized offline directly at its final
 content-addressed prefix, because conda packages may embed that absolute
 prefix in shebangs or binary metadata. The service account consumes only the
@@ -292,6 +337,29 @@ verification. Static verification does not require API, worker, Redis, or
 Docker to be running and does not treat an externally prepared reference that
 has not yet been registered as corrupt deployment content; those operational
 conditions belong to `doctor`. Neither command silently repairs state.
+
+The database part of `status`, `doctor`, and `verify` is an online readability
+and candidate-schema check, not an offline database-content or integrity
+attestation. A bounded stdlib-only SQLite reader runs as the database owner
+with `mode=ro` and normal locking/WAL semantics, including committed pages in
+WAL and legitimate API/worker-owned SHM. It pins and rechecks the main file's
+path, owner and inode but does not require mutable bytes or timestamps to stay
+constant. Its separate online schema identity records only device, inode and
+schema heads; it is never substituted for an offline inspection or backup
+witness. Connections close explicitly on success and failure, with no DML,
+migration, checkpoint, journal-mode change, `immutable` or `nolock` option.
+The root operator compares those heads with the current active Platform's
+natively admitted migration inventory, rechecking its indexed bytes and
+root-owned immutable file boundary. Status does not rehash unrelated runtime
+bundles. Only compatible observations carry a schema identity, bound to the
+observed state and active slots; the public CLI projects that result while
+retaining its deferred native resolver. Full `verify` still performs native
+admission independently. Query and compatibility failures have separate
+path-free operator diagnostic phases.
+The existing writer-stop, strict sidecar, full integrity and content checks
+remain mandatory for migration, backup and recovery. Final acceptance checks
+online diagnostics while the API/worker are running; any separate offline
+integrity evidence is labelled and retained independently.
 
 ### Deployment Gate operator flow
 

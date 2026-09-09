@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import errno
 import fcntl
 import grp
 import hashlib
@@ -17,11 +18,14 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import socket
 import stat
 import subprocess
 import sys
+import syslog
 import tempfile
+import time
 from typing import Protocol
 
 from encode_pipeline.deployment.bundle import BundleStore
@@ -42,6 +46,7 @@ from encode_pipeline.deployment.database import (
     database_content_identity,
     fresh_database_candidate_path,
     inspect_database,
+    observe_online_database,
     publish_fresh_database,
     quarantine_invalid_fresh_database,
     quarantine_fresh_database,
@@ -58,6 +63,7 @@ from encode_pipeline.deployment.models import (
     DeploymentState,
 )
 from encode_pipeline.deployment.operator_transaction import (
+    _operator_phase,
     OperatorJournalHandle,
     OperatorJournalStore,
     OperatorJournalSummary,
@@ -145,6 +151,32 @@ SERVICE_SOCKET_NAMES: dict[str, tuple[str, ...]] = {
     "helixweave-docker-rootless.service": ("bulk-docker",),
 }
 
+
+def _observation_diagnostic(
+    phase: str,
+    code: str,
+    *,
+    unit: str | None = None,
+    task: str | None = None,
+    differing_fields: tuple[str, ...] = (),
+) -> None:
+    """Small local breadcrumbs, separate from public receipts and raw errors."""
+    record: dict[str, object] = {"phase": phase, "code": code}
+    if unit in SERVICE_UNITS:
+        record["unit"] = unit
+    if task is not None and _valid_task_identity(task):
+        record["task_identity"] = task
+    if differing_fields:
+        record["differing_fields"] = differing_fields
+    try:
+        syslog.syslog(
+            syslog.LOG_INFO,
+            "helixweave-observation " + canonical_json_bytes(record).decode().strip(),
+        )
+    except OSError:
+        pass  # A local logging failure cannot change the observation outcome.
+
+
 SYSTEMCTL = Path("/usr/bin/systemctl")
 SAFE_ENVIRONMENT = {
     "LANG": "C.UTF-8",
@@ -152,6 +184,20 @@ SAFE_ENVIRONMENT = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
 }
 _SYSTEMCTL_TIMEOUT_SECONDS = 15.0
+_SERVICE_READINESS_POLL_SECONDS = 0.1
+_READINESS_UNITS = (
+    "helixweave-docker-rootless.service",
+    "helixweave-api.service",
+    "helixweave-worker.service",
+)
+_DOCKER_ROOTLESS_SCRIPT_SHA256 = (
+    "904c9b9e35f6927c0a5e65afb4d35b6bc9eb1278c878044501281fc728c9be46"
+)
+# This reader supports the existing, unchanged candidate launcher, including
+# journal-bound older releases. Never infer executable/argv from a live process.
+_WORKER_LAUNCHER_SHA256 = (
+    "9665d1c245604e90347c42e1216d7f2e223d24008ffbe7473e511af9f24ba904"
+)
 _BULK_RUNTIME_SYSTEMD_TIMEOUT_SECONDS = 14_700.0
 _MAX_COMMAND_OUTPUT = 64 * 1024
 _MAX_OPERATOR_DOCUMENT_BYTES = 1024 * 1024
@@ -1254,6 +1300,8 @@ class FixedSystemctl:
 
 
 class ServiceProbe(Protocol):
+    def require_process_absent(self, service: ServiceIdentity) -> None: ...
+
     def observe(
         self,
         *,
@@ -1261,6 +1309,25 @@ class ServiceProbe(Protocol):
         deployment_identity: str,
         task_identity: str,
     ) -> ServiceIdentity | None: ...
+
+
+class _ServiceReadinessPending(Exception):
+    """A verified process has not reached its fixed service entry point."""
+
+    def __init__(
+        self,
+        api_process: tuple[int, int, str, str] | None = None,
+        entry_stages: tuple[int, int] | None = None,
+        docker_stages: tuple[int, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.api_process = api_process
+        self.entry_stages = entry_stages
+        self.docker_stages = docker_stages
+
+
+class _ProcScanPending(_ServiceReadinessPending):
+    """Only an ENOENT from enumeration of a procfs PID/FD directory."""
 
 
 class LinuxServiceProbe:
@@ -1288,10 +1355,15 @@ class LinuxServiceProbe:
         cgroup_root: Path = Path("/sys/fs/cgroup"),
         unix_sockets: dict[str, Path] | None = None,
         filesystem_socket_stat: Callable[[Path], os.stat_result] | None = None,
+        layout: DeploymentLayout | None = None,
+        owner_uid: int = 0,
+        owner_gid: int = 0,
     ) -> None:
         self.systemctl = systemctl
         self.proc_root = proc_root
         self.cgroup_root = cgroup_root
+        self.layout = DeploymentLayout.supported() if layout is None else layout
+        self.owner_uid, self.owner_gid = owner_uid, owner_gid
         self.unix_sockets = (
             dict(self._UNIX_SOCKETS) if unix_sockets is None else dict(unix_sockets)
         )
@@ -1315,6 +1387,323 @@ class LinuxServiceProbe:
         unit: str,
         deployment_identity: str,
         task_identity: str,
+    ) -> ServiceIdentity | None:
+        return self._observe(
+            unit=unit,
+            deployment_identity=deployment_identity,
+            task_identity=task_identity,
+            allow_socket_pending=False,
+        )
+
+    def observe_starting(
+        self,
+        *,
+        unit: str,
+        deployment_identity: str,
+        task_identity: str,
+    ) -> ServiceIdentity | None:
+        """Distinguish only verified pending states of bounded-start units."""
+
+        if unit not in _READINESS_UNITS:
+            return self.observe(
+                unit=unit,
+                deployment_identity=deployment_identity,
+                task_identity=task_identity,
+            )
+        return self._observe(
+            unit=unit,
+            deployment_identity=deployment_identity,
+            task_identity=task_identity,
+            allow_socket_pending=True,
+        )
+
+    def require_process_absent(self, service: ServiceIdentity) -> None:
+        """A stopped unit alone does not prove its former PID has disappeared."""
+        try:
+            boot = (self.proc_root / "sys/kernel/random/boot_id").read_bytes()
+            if not 0 < len(boot) <= 128:
+                raise ValueError
+            if _bytes_identity(boot.strip()) != service.boot_identity:
+                return
+            try:
+                raw = (self.proc_root / str(service.main_pid) / "stat").read_bytes()
+            except FileNotFoundError:
+                return
+            closing = raw.rfind(b")")
+            if closing < 1 or len(raw) > _MAX_COMMAND_OUTPUT:
+                raise ValueError
+            if int(raw[closing + 2 :].split()[19]) != service.process_start_ticks:
+                return  # PID reuse is not survival of the retained process.
+        except (OSError, ValueError, IndexError):
+            pass
+        raise fail(
+            "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+            "Retained Redis process absence is unverified.",
+        )
+
+    def _worker_launch_forms(
+        self, deployment_identity: str
+    ) -> tuple[tuple[bytes, os.stat_result], ...]:
+        return self._candidate_launch_forms(deployment_identity, "worker")
+
+    def _candidate_launch_forms(
+        self, deployment_identity: str, command: str
+    ) -> tuple[tuple[bytes, os.stat_result], ...]:
+        """Read the selected release's launcher contract without executing it."""
+        if command not in {"api", "worker"}:
+            raise ValueError
+        manifest = BundleStore(self.layout).read_installed_manifest(
+            PLATFORM,
+            deployment_identity,
+            expected_owner_uid=self.owner_uid,
+            expected_owner_gid=self.owner_gid,
+        )
+        release = self.layout.platform_releases / deployment_identity
+        relative = "payload/platform/bin/helixweave-service"
+        record = next((f for f in manifest.files if f.path == relative), None)
+        binary = release / relative
+        for parent in (
+            binary.parent,
+            binary.parent.parent,
+            binary.parent.parent.parent,
+        ):
+            observed = parent.lstat()
+            if not stat.S_ISDIR(observed.st_mode) or (
+                observed.st_uid,
+                observed.st_gid,
+                stat.S_IMODE(observed.st_mode),
+            ) != (self.owner_uid, self.owner_gid, 0o555):
+                raise OSError
+        content, observed = read_regular_file(
+            binary, max_bytes=64 * 1024, code="OPERATOR_SERVICE_OBSERVE_FAILED"
+        )
+        if (
+            record is None
+            or record.mode != 0o555
+            or record.size_bytes != len(content)
+            or record.sha256 != hashlib.sha256(content).hexdigest()
+            or record.sha256 != _WORKER_LAUNCHER_SHA256
+            or (observed.st_uid, observed.st_gid, stat.S_IMODE(observed.st_mode))
+            != (self.owner_uid, self.owner_gid, 0o555)
+        ):
+            raise OSError
+        # Validate the dispatcher bytes through the existing stable boundary.
+        verify_stable_operator_boundary()
+        python = "/usr/bin/python3.12"
+        site_packages = release / "payload/platform/lib/python3.12/site-packages"
+        bootstrap = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(site_packages)!r})\n"
+            "from pathlib import Path\n"
+            "from encode_pipeline.deployment.platform_runtime import candidate_service_main\n"
+            f"raise SystemExit(candidate_service_main(({command!r},), "
+            f"release_root=Path({str(release)!r})))\n"
+        )
+        commands = (
+            (
+                "/usr/bin/python3",
+                "-I",
+                "/usr/libexec/helixweave-active-service",
+                command,
+            ),
+            (python, "-I", str(binary), command),
+            (python, "-I", "-S", "-c", bootstrap),
+        )
+        forms = []
+        for argv in commands:
+            executable = Path(argv[0]).stat()
+            if (
+                not stat.S_ISREG(executable.st_mode)
+                or executable.st_uid != 0
+                or executable.st_gid != 0
+                or executable.st_mode & 0o022
+                or not executable.st_mode & 0o111
+            ):
+                raise OSError
+            forms.append((b"\0".join(a.encode() for a in argv) + b"\0", executable))
+        return tuple(forms)
+
+    def _docker_launch_forms(
+        self,
+    ) -> tuple[tuple[tuple[bytes, ...], os.stat_result], ...]:
+        """The fixed script execs RootlessKit in MainPID; dockerd is its child.
+
+        Derive argv from the selected shipped unit and the verified Docker
+        29.5.2 script, never from a process being observed. Only the script's
+        automatic network-driver defaults are recognized (no override flags).
+        """
+        verify_stable_operator_boundary()
+        script = Path("/usr/bin/dockerd-rootless.sh")
+        content, observed = read_regular_file(
+            script, max_bytes=64 * 1024, code="OPERATOR_SERVICE_OBSERVE_FAILED"
+        )
+        if (
+            hashlib.sha256(content).hexdigest() != _DOCKER_ROOTLESS_SCRIPT_SHA256
+            or (observed.st_uid, observed.st_gid) != (0, 0)
+            or observed.st_mode & 0o022
+            or not observed.st_mode & 0o111
+        ):
+            raise OSError
+        unit, _ = read_regular_file(
+            Path("/opt/helixweave/operator/current/templates")
+            / "helixweave-docker-rootless.service",
+            max_bytes=64 * 1024,
+            code="OPERATOR_SERVICE_OBSERVE_FAILED",
+        )
+        starts = [
+            line[10:]
+            for line in unit.decode().splitlines()
+            if line.startswith("ExecStart=")
+        ]
+        if len(starts) != 1:
+            raise ValueError
+        argv = tuple(shlex.split(starts[0]))
+        if not argv or argv[0] != str(script):
+            raise ValueError
+
+        def encode(values: tuple[str, ...]) -> bytes:
+            return b"\0".join(v.encode() for v in values) + b"\0"
+
+        # All alternatives below come from the pinned script's default branch.
+        # Do not accept arbitrary args or infer a new supported form from /proc.
+        final = tuple(
+            encode(
+                (
+                    "rootlesskit",
+                    "--state-dir=/run/helixweave/docker/dockerd-rootless",
+                    "--net=" + driver,
+                    "--mtu=" + ("1500" if driver == "vpnkit" else "65520"),
+                    "--slirp4netns-sandbox=auto",
+                    "--slirp4netns-seccomp=auto",
+                    "--disable-host-loopback",
+                    "--port-driver=" + ("implicit" if driver == "pasta" else "builtin"),
+                    "--copy-up=/etc",
+                    "--copy-up=/run",
+                    "--propagation=rslave",
+                    "--detach-netns",
+                    *argv,
+                )
+            )
+            for driver in ("slirp4netns", "pasta", "vpnkit", "gvisor-tap-vsock")
+        )
+        forms = []
+        for commands, executable in (
+            ((encode(("/bin/sh", *argv)),), Path("/bin/sh")),
+            (final, Path("/usr/bin/rootlesskit")),
+        ):
+            witness = executable.stat()
+            if (
+                not stat.S_ISREG(witness.st_mode)
+                or (witness.st_uid, witness.st_gid) != (0, 0)
+                or witness.st_mode & 0o022
+                or not witness.st_mode & 0o111
+            ):
+                raise OSError
+            forms.append((commands, witness))
+        return tuple(forms)
+
+    def _stability_diagnostic(
+        self,
+        *,
+        unit: str,
+        deployment_identity: str,
+        task_identity: str,
+        values: dict[str, str],
+        final_values: dict[str, str],
+        closing: int,
+        final_closing: int,
+        start_ticks: int,
+        final_start_ticks: int,
+        executable: os.stat_result,
+        final_executable: os.stat_result,
+        cmdline: bytes,
+        final_cmdline: bytes,
+    ) -> None:
+        """Describe the rejected snapshots, never re-observe the failed process."""
+        try:
+            changed = [
+                "systemd." + name
+                for name in FixedSystemctl._SHOW_PROPERTIES
+                if values.get(name) != final_values.get(name)
+            ]
+            valid = (closing >= 1, final_closing >= 1)
+            if not all(valid):
+                changed.append("stat_parse_validity")
+            if start_ticks != final_start_ticks:
+                changed.append("process_start_ticks")
+            for name in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            ):
+                if getattr(executable, name) != getattr(final_executable, name):
+                    changed.append("executable." + name)
+            if cmdline != final_cmdline:
+                changed.append("cmdline")
+            forms = {}
+            try:
+                if unit == "helixweave-docker-rootless.service":
+                    forms = {
+                        argv: name
+                        for (commands, _binary), name in zip(
+                            self._docker_launch_forms(),
+                            ("rootless-script", "rootlesskit-parent"),
+                            strict=True,
+                        )
+                        for argv in commands
+                    }
+                else:
+                    command = {
+                        "helixweave-api.service": "api",
+                        "helixweave-worker.service": "worker",
+                    }[unit]
+                    forms = {
+                        argv: name
+                        for (argv, _binary), name in zip(
+                            self._candidate_launch_forms(deployment_identity, command),
+                            ("dispatcher", "platform-launcher", "final-entry"),
+                            strict=True,
+                        )
+                    }
+            except Exception:
+                pass  # A candidate lookup failure is not evidence of a known form.
+            record = {
+                "phase": "process-stability",
+                "code": "OBSERVATION_CHANGED",
+                "changed_fields": changed,
+                "stat_parse_validity": {"before": valid[0], "after": valid[1]},
+                "launcher_forms": {
+                    "before": forms.get(cmdline, "unknown"),
+                    "after": forms.get(final_cmdline, "unknown"),
+                },
+            }
+            if unit in SERVICE_UNITS:
+                record["unit"] = unit
+            if _valid_task_identity(task_identity):
+                record["task_identity"] = task_identity
+            if _CONTENT_IDENTITY.fullmatch(deployment_identity):
+                record["deployment_identity"] = deployment_identity
+            syslog.syslog(
+                syslog.LOG_INFO,
+                "helixweave-observation "
+                + canonical_json_bytes(record).decode().strip(),
+            )
+        except Exception:
+            pass  # Diagnostics cannot replace the original observation rejection.
+
+    def _observe(
+        self,
+        *,
+        unit: str,
+        deployment_identity: str,
+        task_identity: str,
+        allow_socket_pending: bool,
     ) -> ServiceIdentity | None:
         values = self.systemctl.show(unit)
         active = values["ActiveState"]
@@ -1345,6 +1734,21 @@ class LinuxServiceProbe:
                 "Service status could not be observed.",
             )
         try:
+            entry_forms = (
+                (
+                    self._worker_launch_forms(deployment_identity)
+                    if unit == "helixweave-worker.service"
+                    else self._candidate_launch_forms(deployment_identity, "api")
+                )
+                if allow_socket_pending
+                and unit in {"helixweave-api.service", "helixweave-worker.service"}
+                else None
+            )
+            docker_forms = (
+                self._docker_launch_forms()
+                if allow_socket_pending and unit == "helixweave-docker-rootless.service"
+                else None
+            )
             process = self.proc_root / str(main_pid)
             raw_stat = (process / "stat").read_bytes()
             closing = raw_stat.rfind(b")")
@@ -1353,7 +1757,9 @@ class LinuxServiceProbe:
             executable = (process / "exe").stat()
             cmdline = (process / "cmdline").read_bytes()
             boot = (self.proc_root / "sys/kernel/random/boot_id").read_bytes()
-        except (OSError, ValueError, IndexError):
+            if entry_forms is not None or docker_forms is not None:
+                worker_status = (process / "status").read_bytes()
+        except (OSError, ValueError, IndexError, StableBoundaryError):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
@@ -1370,12 +1776,27 @@ class LinuxServiceProbe:
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
             )
-        sockets = self._socket_witnesses(
-            unit=unit,
-            cgroup=expected_cgroup,
-            main_pid=main_pid,
-        )
+        scan_pending = False
         try:
+            sockets = self._socket_witnesses(
+                unit=unit,
+                cgroup=expected_cgroup,
+                main_pid=main_pid,
+                allow_socket_pending=allow_socket_pending,
+            )
+        except _ServiceReadinessPending as pending:
+            if unit not in {
+                "helixweave-api.service",
+                "helixweave-docker-rootless.service",
+            }:
+                raise
+            scan_pending = isinstance(pending, _ProcScanPending)
+            # Absence is not a successful observation. Before classifying it as
+            # pending, still verify cgroup membership and every stability check.
+            sockets = None
+        try:
+            if sockets is None and main_pid not in self._cgroup_pids(expected_cgroup):
+                raise OSError
             final_values = self.systemctl.show(unit)
             final_stat = (process / "stat").read_bytes()
             final_closing = final_stat.rfind(b")")
@@ -1383,7 +1804,31 @@ class LinuxServiceProbe:
             final_start_ticks = int(final_fields[19])
             final_executable = (process / "exe").stat()
             final_cmdline = (process / "cmdline").read_bytes()
-        except (OSError, ValueError, IndexError):
+            if entry_forms is not None or docker_forms is not None:
+                final_worker_status = (process / "status").read_bytes()
+                account = pwd.getpwnam(
+                    "helixweave-api"
+                    if unit == "helixweave-api.service"
+                    else "helixweave"
+                )
+                # The API unit overrides its account's primary group with the
+                # shared runtime group; derive the witness from that contract.
+                gid = (
+                    grp.getgrnam("helixweave").gr_gid
+                    if unit == "helixweave-api.service"
+                    else account.pw_gid
+                )
+                for raw_status in (worker_status, final_worker_status):
+                    fields = dict(
+                        line.split(b":", 1) for line in raw_status.splitlines()
+                    )
+                    if fields[b"Uid"].split() != [str(account.pw_uid).encode()] * 4 or (
+                        fields[b"Gid"].split() != [str(gid).encode()] * 4
+                    ):
+                        raise OSError
+                if main_pid not in self._cgroup_pids(expected_cgroup):
+                    raise OSError
+        except (OSError, ValueError, IndexError, KeyError):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
@@ -1392,12 +1837,149 @@ class LinuxServiceProbe:
             final_closing < 1
             or final_values != values
             or final_start_ticks != start_ticks
-            or _file_witness(final_executable) != _file_witness(executable)
-            or final_cmdline != cmdline
+            or (
+                entry_forms is None
+                and docker_forms is None
+                and (
+                    _file_witness(final_executable) != _file_witness(executable)
+                    or final_cmdline != cmdline
+                )
+            )
         ):
+            self._stability_diagnostic(
+                unit=unit,
+                deployment_identity=deployment_identity,
+                task_identity=task_identity,
+                values=values,
+                final_values=final_values,
+                closing=closing,
+                final_closing=final_closing,
+                start_ticks=start_ticks,
+                final_start_ticks=final_start_ticks,
+                executable=executable,
+                final_executable=final_executable,
+                cmdline=cmdline,
+                final_cmdline=final_cmdline,
+            )
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service status could not be observed.",
+            )
+        if docker_forms is not None:
+            stages = []
+            for command, binary in (
+                (cmdline, executable),
+                (final_cmdline, final_executable),
+            ):
+                stage = next(
+                    (
+                        i
+                        for i, (commands, expected_binary) in enumerate(docker_forms)
+                        if command in commands
+                        and _file_witness(binary) == _file_witness(expected_binary)
+                    ),
+                    None,
+                )
+                if stage is None or (
+                    stages
+                    and (
+                        stage < stages[-1]
+                        or (stage == stages[-1] and command != cmdline)
+                    )
+                ):
+                    self._stability_diagnostic(
+                        unit=unit,
+                        deployment_identity=deployment_identity,
+                        task_identity=task_identity,
+                        values=values,
+                        final_values=final_values,
+                        closing=closing,
+                        final_closing=final_closing,
+                        start_ticks=start_ticks,
+                        final_start_ticks=final_start_ticks,
+                        executable=executable,
+                        final_executable=final_executable,
+                        cmdline=cmdline,
+                        final_cmdline=final_cmdline,
+                    )
+                    raise fail(
+                        "OPERATOR_SERVICE_OBSERVE_FAILED",
+                        "Service status could not be observed.",
+                    )
+                stages.append(stage)
+            if stages != [1, 1]:
+                raise _ServiceReadinessPending(
+                    (
+                        main_pid,
+                        start_ticks,
+                        _bytes_identity(values["InvocationID"].encode()),
+                        _bytes_identity(boot.strip()),
+                    ),
+                    docker_stages=(stages[0], stages[1]),
+                )
+        if entry_forms is not None:
+            stages = []
+            for command, binary in (
+                (cmdline, executable),
+                (final_cmdline, final_executable),
+            ):
+                stage = next(
+                    (
+                        i
+                        for i, (expected_command, expected_binary) in enumerate(
+                            entry_forms
+                        )
+                        if command == expected_command
+                        and _file_witness(binary) == _file_witness(expected_binary)
+                    ),
+                    None,
+                )
+                if stage is None or (stages and stage < stages[-1]):
+                    self._stability_diagnostic(
+                        unit=unit,
+                        deployment_identity=deployment_identity,
+                        task_identity=task_identity,
+                        values=values,
+                        final_values=final_values,
+                        closing=closing,
+                        final_closing=final_closing,
+                        start_ticks=start_ticks,
+                        final_start_ticks=final_start_ticks,
+                        executable=executable,
+                        final_executable=final_executable,
+                        cmdline=cmdline,
+                        final_cmdline=final_cmdline,
+                    )
+                    raise fail(
+                        "OPERATOR_SERVICE_OBSERVE_FAILED",
+                        "Service status could not be observed.",
+                    )
+                stages.append(stage)
+            # Even a legitimate exec within this observation is not success:
+            # require another full observation of the final fixed entry point.
+            if stages != [2, 2]:
+                raise _ServiceReadinessPending(
+                    (
+                        main_pid,
+                        start_ticks,
+                        _bytes_identity(values["InvocationID"].encode()),
+                        _bytes_identity(boot.strip()),
+                    ),
+                    entry_stages=(stages[0], stages[1]),
+                )
+        if sockets is None:
+            pending_type = (
+                _ProcScanPending if scan_pending else _ServiceReadinessPending
+            )
+            raise pending_type(
+                (
+                    main_pid,
+                    start_ticks,
+                    _bytes_identity(values["InvocationID"].encode()),
+                    _bytes_identity(boot.strip()),
+                ),
+                docker_stages=(1, 1) if docker_forms is not None else None,
+                entry_stages=(2, 2) if entry_forms is not None else None,
             )
         return ServiceIdentity.create(
             unit=unit,
@@ -1420,12 +2002,15 @@ class LinuxServiceProbe:
         unit: str,
         cgroup: str,
         main_pid: int,
+        allow_socket_pending: bool = False,
     ) -> tuple[SocketWitness, ...]:
         names = SERVICE_SOCKET_NAMES[unit]
         if not names:
             return ()
         if unit == "helixweave-api.service":
-            observed = self._api_socket(cgroup, main_pid=main_pid)
+            observed = self._api_socket(
+                cgroup, main_pid=main_pid, allow_socket_pending=allow_socket_pending
+            )
             return (
                 SocketWitness(
                     "api-http",
@@ -1435,31 +2020,56 @@ class LinuxServiceProbe:
                 ),
             )
         path = self.unix_sockets[unit]
+        scan_pending = False
         try:
-            before = self.filesystem_socket_stat(path)
+            try:
+                before = self.filesystem_socket_stat(path)
+            except FileNotFoundError:
+                if allow_socket_pending:
+                    raise _ServiceReadinessPending from None
+                raise OSError from None
+            if not stat.S_ISSOCK(before.st_mode) or before.st_nlink != 1:
+                raise OSError
+            kernel_inode = self._listening_unix_socket_inode(
+                path,
+                allow_socket_pending=allow_socket_pending,
+                unit=unit,
+            )
             pids_before = self._cgroup_pids(cgroup)
             if main_pid not in pids_before:
                 raise OSError
-            kernel_inode = self._listening_unix_socket_inode(path)
-            if not self._pids_own_socket(pids_before, kernel_inode):
-                raise OSError
+            try:
+                if not self._pids_own_socket(pids_before, kernel_inode):
+                    raise OSError
+            except _ProcScanPending:
+                if (
+                    not allow_socket_pending
+                    or unit != "helixweave-docker-rootless.service"
+                ):
+                    raise OSError from None
+                # Discard all ownership results. The outer observer must still
+                # prove the main process stable before allowing a fresh scan.
+                scan_pending = True
             pids_after = self._cgroup_pids(cgroup)
             after = self.filesystem_socket_stat(path)
+        except _ServiceReadinessPending:
+            raise
         except OSError:
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service socket could not be observed.",
             ) from None
         if (
-            not stat.S_ISSOCK(before.st_mode)
-            or before.st_nlink != 1
-            or _file_witness(before) != _file_witness(after)
-            or pids_before != pids_after
+            _file_witness(before) != _file_witness(after)
+            or main_pid not in pids_after
+            or (not scan_pending and pids_before != pids_after)
         ):
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
                 "Service socket could not be observed.",
             )
+        if scan_pending:
+            raise _ProcScanPending
         return (
             SocketWitness(
                 names[0],
@@ -1469,12 +2079,27 @@ class LinuxServiceProbe:
             ),
         )
 
-    def _api_socket(self, cgroup: str, *, main_pid: int) -> os.stat_result:
+    def _api_socket(
+        self, cgroup: str, *, main_pid: int, allow_socket_pending: bool = False
+    ) -> os.stat_result:
         inodes: set[int] = set()
         try:
             lines = (
                 (self.proc_root / "net/tcp").read_text(encoding="ascii").splitlines()
             )
+            if allow_socket_pending:
+                # A listener on the configured port but a different endpoint is
+                # an identity failure, not permission to wait for another one.
+                ipv6 = (self.proc_root / "net/tcp6").read_text(encoding="ascii")
+                for line in (*lines[1:], *ipv6.splitlines()[1:]):
+                    fields = line.split()
+                    if (
+                        len(fields) >= 4
+                        and fields[1].endswith(":1F40")
+                        and fields[3] == "0A"
+                        and fields[1] != "0100007F:1F40"
+                    ):
+                        raise OSError
         except OSError:
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
@@ -1487,6 +2112,8 @@ class LinuxServiceProbe:
                     inodes.add(int(fields[9]))
                 except ValueError:
                     pass
+        if not inodes and allow_socket_pending:
+            raise _ServiceReadinessPending
         if len(inodes) != 1:
             raise fail(
                 "OPERATOR_SERVICE_OBSERVE_FAILED",
@@ -1501,13 +2128,21 @@ class LinuxServiceProbe:
             )
         return observed
 
-    def _listening_unix_socket_inode(self, socket_path: Path) -> int:
+    def _listening_unix_socket_inode(
+        self,
+        socket_path: Path,
+        *,
+        allow_socket_pending: bool = False,
+        unit: str | None = None,
+    ) -> int:
+        reason = "UNIX_TABLE_UNAVAILABLE"
         try:
             content = _read_bounded_path(
                 self.proc_root / "net/unix",
                 self._MAX_PROC_NET_UNIX_BYTES,
             )
             lines = content.splitlines()
+            reason = "UNIX_TABLE_INVALID"
             if not lines or len(lines) > self._MAX_PROC_NET_UNIX_LINES:
                 raise OSError
             rendered_path = str(socket_path)
@@ -1516,20 +2151,32 @@ class LinuxServiceProbe:
                 fields = raw_line.decode("utf-8").split(maxsplit=7)
                 if len(fields) != 8 or fields[7] != rendered_path:
                     continue
+                reason = "UNIX_SOCKET_ROW_INVALID"
                 flags = int(fields[3], 16)
                 kernel_inode = int(fields[6], 10)
+                if not 0 < kernel_inode <= 2**63 - 1:
+                    raise OSError
+                # Accepted stream connections retain the listener's pathname
+                # in /proc/net/unix. They are not competing listener identities.
+                if fields[4] == "0001" and fields[5] == "03" and flags == 0:
+                    continue
                 if (
                     fields[4] != "0001"
                     or fields[5] != "01"
                     or not flags & self._SO_ACCEPTCON
-                    or not 0 < kernel_inode <= 2**63 - 1
                 ):
                     raise OSError
                 matches.append(kernel_inode)
+            if not matches and allow_socket_pending:
+                _observation_diagnostic("unix-listener", "LISTENER_PENDING", unit=unit)
+                raise _ServiceReadinessPending
+            reason = "LISTENER_MISSING" if not matches else "LISTENER_AMBIGUOUS"
             if len(matches) != 1:
                 raise OSError
+            _observation_diagnostic("unix-listener", "OK", unit=unit)
             return matches[0]
         except (OSError, UnicodeError, ValueError):
+            _observation_diagnostic("unix-listener", reason, unit=unit)
             raise OSError from None
 
     def _cgroup_pids(self, cgroup: str) -> frozenset[int]:
@@ -1564,11 +2211,15 @@ class LinuxServiceProbe:
                             raise OSError
                         try:
                             target = os.readlink(descriptor.path)
-                        except OSError:
+                        except OSError as error:
+                            if error.errno == errno.ENOENT:
+                                raise _ProcScanPending from None
                             raise OSError from None
                         if target == f"socket:[{inode}]":
                             owned = True
-            except OSError:
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    raise _ProcScanPending from None
                 raise OSError from None
         return owned
 
@@ -1610,6 +2261,38 @@ class LinuxServiceProbe:
 
 
 class ServiceController(Protocol):
+    def recover_retained_redis_start(
+        self,
+        request: OperatorRequest,
+        *,
+        prior: str,
+        previous: str | None,
+        journal: OperatorJournalHandle,
+    ) -> ServiceIdentity: ...
+
+    def verify_redis_replacement(
+        self, record: OperatorTransaction, *, prior: str, candidate: str
+    ) -> ServiceIdentity: ...
+
+    def prepare_redis_transfer(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str | None = None,
+    ) -> ServiceIdentity | None: ...
+
+    def transfer_redis_binding(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str,
+        restore: bool,
+    ) -> None: ...
+
     def start(self, request: OperatorRequest) -> ServiceIdentity: ...
 
     def recover_start(self, request: OperatorRequest) -> ServiceIdentity: ...
@@ -1637,35 +2320,149 @@ class SystemdServiceController:
     ) -> None:
         self.layout = layout
         self.systemctl = FixedSystemctl() if systemctl is None else systemctl
-        self.probe = LinuxServiceProbe(self.systemctl) if probe is None else probe
+        self.probe = (
+            LinuxServiceProbe(
+                self.systemctl, layout=layout, owner_uid=owner_uid, owner_gid=owner_gid
+            )
+            if probe is None
+            else probe
+        )
         self.owner_uid = owner_uid
         self.owner_gid = owner_gid
 
     def start(self, request: OperatorRequest) -> ServiceIdentity:
         assert request.unit is not None
-        existing = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=request.task_identity,
-        )
+        with _operator_phase("start-preflight-observe", request):
+            existing = self.probe.observe(
+                unit=request.unit,
+                deployment_identity=request.deployment_identity,
+                task_identity=request.task_identity,
+            )
         if existing is not None:
             raise fail(
                 "OPERATOR_SERVICE_ALREADY_RUNNING", "Service is already running."
             )
-        self.systemctl.control("start", request.unit)
-        service = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=request.task_identity,
+        readiness_deadline = (
+            time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS
+            if request.unit in _READINESS_UNITS
+            else None
         )
-        if service is None:
-            raise fail(
-                "OPERATOR_SERVICE_START_FAILED",
-                "Service did not enter the running state.",
-                recoverable=True,
+        with _operator_phase("systemctl-start", request):
+            self.systemctl.control("start", request.unit)
+        with _operator_phase("strong-observe", request):
+            service = self._observe_started_service(
+                request,
+                readiness_deadline=readiness_deadline,
             )
+            if service is None:
+                raise fail(
+                    "OPERATOR_SERVICE_START_FAILED",
+                    "Service did not enter the running state.",
+                    recoverable=True,
+                )
         self._persist_started_service(service)
         return service
+
+    def _observe_started_service(
+        self,
+        request: OperatorRequest,
+        *,
+        readiness_deadline: float | None,
+    ) -> ServiceIdentity | None:
+        assert request.unit is not None
+        if request.unit not in _READINESS_UNITS:
+            return self.probe.observe(
+                unit=request.unit,
+                deployment_identity=request.deployment_identity,
+                task_identity=request.task_identity,
+            )
+        observer = getattr(self.probe, "observe_starting", self.probe.observe)
+        assert readiness_deadline is not None
+        api_process = None
+        entry_stage = -1
+        docker_stage = -1
+        while True:
+            if time.monotonic() >= readiness_deadline:
+                raise fail(
+                    "OPERATOR_SERVICE_START_FAILED",
+                    "Service did not enter the running state.",
+                    recoverable=True,
+                )
+            try:
+                service = observer(
+                    unit=request.unit,
+                    deployment_identity=request.deployment_identity,
+                    task_identity=request.task_identity,
+                )
+            except _ServiceReadinessPending as pending:
+                if request.unit in {
+                    "helixweave-api.service",
+                    "helixweave-worker.service",
+                    "helixweave-docker-rootless.service",
+                }:
+                    if pending.api_process is None or (
+                        api_process is not None and pending.api_process != api_process
+                    ):
+                        raise fail(
+                            "OPERATOR_SERVICE_OBSERVE_FAILED",
+                            "Service status could not be observed.",
+                        ) from None
+                    api_process = pending.api_process
+                if request.unit in {
+                    "helixweave-api.service",
+                    "helixweave-worker.service",
+                }:
+                    if pending.entry_stages is None or (
+                        pending.entry_stages[0] < entry_stage
+                    ):
+                        raise fail(
+                            "OPERATOR_SERVICE_OBSERVE_FAILED",
+                            "Service status could not be observed.",
+                        ) from None
+                    entry_stage = pending.entry_stages[1]
+                if (
+                    request.unit == "helixweave-docker-rootless.service"
+                    and pending.docker_stages is not None
+                ):
+                    if pending.docker_stages[0] < docker_stage:
+                        raise fail(
+                            "OPERATOR_SERVICE_OBSERVE_FAILED",
+                            "Service status could not be observed.",
+                        ) from None
+                    docker_stage = pending.docker_stages[1]
+                remaining = readiness_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise fail(
+                        "OPERATOR_SERVICE_START_FAILED",
+                        "Service did not enter the running state.",
+                        recoverable=True,
+                    ) from None
+                time.sleep(min(_SERVICE_READINESS_POLL_SECONDS, remaining))
+                continue
+            if (
+                service is not None
+                and api_process is not None
+                and api_process
+                != (
+                    service.main_pid,
+                    service.process_start_ticks,
+                    service.invocation_identity,
+                    service.boot_identity,
+                )
+            ):
+                raise fail(
+                    "OPERATOR_SERVICE_OBSERVE_FAILED",
+                    "Service status could not be observed.",
+                )
+            # Time spent in systemctl and in the strong probe consumes the same
+            # deadline. A late successful observation must not be persisted.
+            if time.monotonic() >= readiness_deadline:
+                raise fail(
+                    "OPERATOR_SERVICE_START_FAILED",
+                    "Service did not enter the running state.",
+                    recoverable=True,
+                )
+            return service
 
     def recover_start(self, request: OperatorRequest) -> ServiceIdentity:
         """Adopt only this journal-bound start, or execute it idempotently."""
@@ -1677,11 +2474,20 @@ class SystemdServiceController:
     def recover_observe(self, request: OperatorRequest) -> ServiceIdentity | None:
         """Adopt a running service only under an authoritative recovery journal."""
         assert request.unit is not None
-        service = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=request.task_identity,
-        )
+        with _operator_phase("recovery-service-observe", request):
+            service = (
+                self._observe_started_service(
+                    request,
+                    readiness_deadline=time.monotonic() + _SYSTEMCTL_TIMEOUT_SECONDS,
+                )
+                if request.unit
+                in {"helixweave-api.service", "helixweave-worker.service"}
+                else self.probe.observe(
+                    unit=request.unit,
+                    deployment_identity=request.deployment_identity,
+                    task_identity=request.task_identity,
+                )
+            )
         if service is None:
             return None
         self._persist_started_service(service)
@@ -1689,35 +2495,374 @@ class SystemdServiceController:
 
     def status(self, request: OperatorRequest) -> ServiceIdentity | None:
         assert request.unit is not None
-        prior = self._read_identity(request.unit, required=False)
-        if (
-            prior is not None
-            and prior.deployment_identity != request.deployment_identity
-        ):
-            raise fail(
-                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
-                "Service identity does not match this deployment.",
+        try:
+            prior = self._read_identity(request.unit, required=False)
+        except DeploymentError:
+            _observation_diagnostic(
+                "service-identity-read",
+                "IDENTITY_UNAVAILABLE",
+                unit=request.unit,
+                task=request.task_identity,
             )
+            raise
         task = request.task_identity if prior is None else prior.task_identity
-        service = self.probe.observe(
-            unit=request.unit,
-            deployment_identity=request.deployment_identity,
-            task_identity=task,
-        )
+        try:
+            service = self.probe.observe(
+                unit=request.unit,
+                deployment_identity=request.deployment_identity,
+                task_identity=task,
+            )
+        except Exception:
+            _observation_diagnostic(
+                "service-observe",
+                "OBSERVATION_FAILED",
+                unit=request.unit,
+                task=request.task_identity,
+            )
+            raise
         if service is None:
+            _observation_diagnostic(
+                "service-identity",
+                "STOPPED",
+                unit=request.unit,
+                task=request.task_identity,
+            )
             return None
         if prior is None:
+            _observation_diagnostic(
+                "service-identity",
+                "IDENTITY_MISSING",
+                unit=request.unit,
+                task=request.task_identity,
+            )
             raise fail(
                 "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE",
                 "Running service has no trusted operator identity.",
             )
+        if prior.deployment_identity != request.deployment_identity:
+            _observation_diagnostic(
+                "service-identity",
+                "DEPLOYMENT_MISMATCH",
+                unit=request.unit,
+                task=request.task_identity,
+                differing_fields=("deployment_identity",),
+            )
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Service identity does not match this deployment.",
+            )
         if service.identity != prior.identity:
+            expected, observed = prior.to_dict(), service.to_dict()
+            _observation_diagnostic(
+                "service-identity",
+                "IDENTITY_MISMATCH",
+                unit=request.unit,
+                task=request.task_identity,
+                differing_fields=tuple(
+                    sorted(k for k in expected if expected[k] != observed[k])
+                ),
+            )
             raise fail(
                 "OPERATOR_SERVICE_IDENTITY_MISMATCH",
                 "Service identity changed before the requested action.",
                 recoverable=True,
             )
+        _observation_diagnostic(
+            "service-identity", "OK", unit=request.unit, task=request.task_identity
+        )
         return service
+
+    @staticmethod
+    def _redis_bound_to(service: ServiceIdentity, deployment: str) -> ServiceIdentity:
+        values = service.to_dict()
+        del values["identity"]
+        values["deployment_identity"] = deployment
+        values["sockets"] = service.sockets
+        return ServiceIdentity.create(**values)
+
+    def _redis_requirements(self, deployment: str) -> tuple[tuple[str, int, int], ...]:
+        """Compare candidate requirements with the installed, fixed Redis boundary."""
+        manifest = BundleStore(self.layout).read_installed_manifest(
+            PLATFORM,
+            deployment,
+            expected_owner_uid=self.owner_uid,
+            expected_owner_gid=self.owner_gid,
+        )
+        try:
+            verify_stable_operator_boundary()
+            signature = []
+            for installed in (
+                Path("/etc/helixweave/redis.conf"),
+                Path("/usr/lib/systemd/system/helixweave-redis.service"),
+            ):
+                target = UNINSTALL_LINKED_BOUNDARY_TARGETS[installed]
+                link = installed.lstat()
+                if (
+                    not stat.S_ISLNK(link.st_mode)
+                    or link.st_nlink != 1
+                    or (link.st_uid, link.st_gid) != (self.owner_uid, self.owner_gid)
+                    or os.readlink(installed) != str(target)
+                ):
+                    raise ValueError
+                content, observed = read_regular_file(
+                    target.resolve(strict=True),
+                    max_bytes=64 * 1024,
+                    code="DEPLOYMENT_COMPATIBILITY_FAILED",
+                )
+                relative = (
+                    "payload/platform/lib/python3.12/site-packages/"
+                    f"encode_pipeline/deployment/templates/{target.name}"
+                )
+                record = next((f for f in manifest.files if f.path == relative), None)
+                if (
+                    record is None
+                    or (
+                        observed.st_uid,
+                        observed.st_gid,
+                        stat.S_IMODE(observed.st_mode),
+                    )
+                    != (self.owner_uid, self.owner_gid, 0o444)
+                    or (record.sha256, record.size_bytes, record.mode)
+                    != (hashlib.sha256(content).hexdigest(), len(content), 0o444)
+                ):
+                    raise ValueError
+                signature.append((record.sha256, record.size_bytes, record.mode))
+            return tuple(signature)
+        except (OSError, ValueError, StableBoundaryError):
+            raise fail(
+                "DEPLOYMENT_COMPATIBILITY_FAILED",
+                "Retained Redis configuration is not compatible.",
+            ) from None
+
+    def prepare_redis_transfer(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str | None = None,
+    ) -> ServiceIdentity | None:
+        """Observe, never adopt, a retained process; return its prior-slot witness.
+
+        A saved previous-slot binding is accepted only inside a new Platform
+        transaction. This repairs completed prerelease upgrades without editing
+        their history or turning ordinary status into a mutating operation.
+        """
+        unit = "helixweave-redis.service"
+        saved = self._read_identity(unit, required=False)
+        observed = self.probe.observe(
+            unit=unit,
+            deployment_identity=prior if saved is None else saved.deployment_identity,
+            task_identity="task-" + "0" * 32 if saved is None else saved.task_identity,
+        )
+        if observed is None:
+            return None
+        if (
+            saved is None
+            or observed != saved
+            or saved.deployment_identity
+            not in (
+                {prior, previous} if witness is None else {prior, candidate, previous}
+            )
+        ):
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity does not match this transaction.",
+            )
+        requirements = self._redis_requirements(prior)
+        for deployment in {candidate, saved.deployment_identity} - {prior}:
+            if self._redis_requirements(deployment) != requirements:
+                raise fail(
+                    "DEPLOYMENT_COMPATIBILITY_FAILED",
+                    "Retained Redis configuration is not compatible.",
+                )
+        projected = self._redis_bound_to(saved, prior)
+        if witness is not None and projected.identity != witness:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity changed during the transaction.",
+            )
+        return projected
+
+    def transfer_redis_binding(
+        self,
+        *,
+        prior: str,
+        candidate: str,
+        previous: str | None,
+        witness: str,
+        restore: bool,
+    ) -> None:
+        observed = self.prepare_redis_transfer(
+            prior=prior,
+            candidate=candidate,
+            previous=previous,
+            witness=witness,
+        )
+        if observed is None or observed.identity != witness:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity changed during the transaction.",
+            )
+        rebound = self._redis_bound_to(observed, prior if restore else candidate)
+        if self._read_identity(rebound.unit, required=True) != rebound:
+            # A persistence failure is recovered by the enclosing journal. Do
+            # not use start's persistence cleanup: stopping Redis loses queues.
+            self._write_identity(rebound)
+        confirmed = self.status(
+            OperatorRequest(
+                operation=STATUS,
+                unit=rebound.unit,
+                deployment_identity=rebound.deployment_identity,
+                task_identity=rebound.task_identity,
+            )
+        )
+        if confirmed != rebound:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity changed during the transaction.",
+            )
+
+    def _redis_replacement_intent(
+        self, record: OperatorTransaction, prior: str, candidate: str
+    ) -> str:
+        requirements = self._redis_requirements(prior)
+        if self._redis_requirements(candidate) != requirements:
+            raise fail(
+                "DEPLOYMENT_COMPATIBILITY_FAILED",
+                "Retained Redis configuration is not compatible.",
+            )
+        return canonical_identity(
+            {
+                "task_identity": record.task_identity,
+                "prior": prior,
+                "candidate": candidate,
+                "retained_redis_identity": record.evidence["retained_redis_identity"],
+                "requirements": requirements,
+                "volatile_state_loss_accepted": True,
+            },
+            scheme="helixweave-retained-redis-replacement-v1",
+        )
+
+    def verify_redis_replacement(
+        self, record: OperatorTransaction, *, prior: str, candidate: str
+    ) -> ServiceIdentity:
+        if not record.point_of_no_return or record.evidence.get(
+            "retained_redis_replacement_intent"
+        ) != self._redis_replacement_intent(record, prior, candidate):
+            raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+        service = self.status(
+            OperatorRequest(
+                operation=STATUS,
+                task_identity=record.task_identity,
+                deployment_identity=candidate,
+                unit="helixweave-redis.service",
+            )
+        )
+        if (
+            service is None
+            or service.task_identity != record.task_identity
+            or service.identity
+            != record.evidence.get("retained_redis_replacement_identity")
+        ):
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Recovered Redis identity does not match this transaction.",
+            )
+        return service
+
+    def recover_retained_redis_start(
+        self,
+        request: OperatorRequest,
+        *,
+        prior: str,
+        previous: str | None,
+        journal: OperatorJournalHandle,
+    ) -> ServiceIdentity:
+        """Explicit journal-task START; never reached by status or transfer."""
+        record = journal.record
+        candidate = request.deployment_identity
+        witness = record.evidence["retained_redis_identity"]
+        intent = self._redis_replacement_intent(record, prior, candidate)
+        saved = self._read_identity("helixweave-redis.service", required=True)
+        assert saved is not None
+        observed = self.probe.observe(
+            unit=saved.unit,
+            deployment_identity=saved.deployment_identity,
+            task_identity=saved.task_identity,
+        )
+        recorded_intent = record.evidence.get("retained_redis_replacement_intent")
+        if recorded_intent is not None:
+            if recorded_intent != intent:
+                raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+            if observed is not None:
+                # An interrupted checkpoint may follow the atomic identity write.
+                # Require that trusted write, not merely a matching live process.
+                if (
+                    saved != observed
+                    or saved.task_identity != record.task_identity
+                    or saved.deployment_identity != candidate
+                    or self._redis_bound_to(saved, prior).identity == witness
+                ):
+                    raise fail(
+                        "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                        "Recovered Redis identity does not match this transaction.",
+                    )
+                journal.record_redis_replacement(
+                    "retained_redis_replacement_identity", saved.identity
+                )
+                return self.verify_redis_replacement(
+                    journal.record, prior=prior, candidate=candidate
+                )
+            if "retained_redis_replacement_identity" in record.evidence:
+                raise fail(
+                    "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                    "Recovered Redis process is no longer running.",
+                )
+        elif observed is not None:
+            self.transfer_redis_binding(
+                prior=prior,
+                candidate=candidate,
+                previous=previous,
+                witness=witness,
+                restore=False,
+            )
+            service = self.status(request)
+            assert service is not None
+            return service  # Live path retains PID, invocation, socket and queue.
+        if (
+            saved.deployment_identity not in {prior, candidate, previous}
+            or self._redis_bound_to(saved, prior).identity != witness
+            or self._redis_requirements(saved.deployment_identity)
+            != self._redis_requirements(prior)
+        ):
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Retained Redis identity does not match this transaction.",
+            )
+        for unit in WRITER_UNITS:
+            if (
+                self.probe.observe(
+                    unit=unit,
+                    deployment_identity=candidate,
+                    task_identity=record.task_identity,
+                )
+                is not None
+            ):
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Writer services must be stopped before Redis recovery.",
+                )
+        self.probe.require_process_absent(saved)
+        journal.record_redis_replacement("retained_redis_replacement_intent", intent)
+        with _operator_phase("retained-redis-explicit-start", record):
+            service = self.start(request)
+        journal.record_redis_replacement(
+            "retained_redis_replacement_identity", service.identity
+        )
+        return self.verify_redis_replacement(
+            journal.record, prior=prior, candidate=candidate
+        )
 
     def stop(self, request: OperatorRequest, *, cleanup: bool) -> None:
         assert request.unit is not None and request.service_identity is not None
@@ -1781,15 +2926,18 @@ class SystemdServiceController:
 
     def _persist_started_service(self, service: ServiceIdentity) -> None:
         try:
-            self._write_identity(service)
+            with _operator_phase("identity-persist", service):
+                self._write_identity(service)
         except DeploymentError:
             try:
-                self.systemctl.control("stop", service.unit)
-                stopped = self.probe.observe(
-                    unit=service.unit,
-                    deployment_identity=service.deployment_identity,
-                    task_identity=service.task_identity,
-                )
+                with _operator_phase("persist-cleanup-stop", service):
+                    self.systemctl.control("stop", service.unit)
+                with _operator_phase("persist-cleanup-observe", service):
+                    stopped = self.probe.observe(
+                        unit=service.unit,
+                        deployment_identity=service.deployment_identity,
+                        task_identity=service.task_identity,
+                    )
             except DeploymentError:
                 raise fail(
                     "OPERATOR_SERVICE_RECOVERY_REQUIRED",
@@ -1922,6 +3070,13 @@ class ObservationProvider(Protocol):
     def observe(self, request: OperatorRequest) -> OperatorObservation: ...
 
 
+def _online_database_writer_uids() -> tuple[int, ...]:
+    try:
+        return (pwd.getpwnam("helixweave-api").pw_uid,)
+    except KeyError:
+        return ()  # No API account can own a legitimate sidecar on this host.
+
+
 class FixedObservationProvider:
     """Read one descriptor-pinned state/schema/service snapshot without writes."""
 
@@ -1949,16 +3104,23 @@ class FixedObservationProvider:
             raise fail("OPERATOR_REQUEST_INVALID", "Operator request is invalid.")
         state = self._read_state(request.deployment_identity)
         try:
-            inspection = inspect_database(
-                self.layout.database,
-                expected_owner_uid=self.service_uid,
-                expected_owner_gid=self.service_gid,
-            )
+            with _operator_phase("online-database-query", request):
+                inspection = observe_online_database(
+                    self.layout.database,
+                    expected_owner_uid=self.service_uid,
+                    expected_owner_gid=self.service_gid,
+                    writer_uids=_online_database_writer_uids(),
+                )
+            with _operator_phase("online-schema-compatibility", request):
+                target = self._active_schema_target(state)
+                if inspection.schema_heads != target:
+                    raise fail(
+                        "DEPLOYMENT_SCHEMA_INCOMPATIBLE",
+                        "Database schema is not compatible with the deployment.",
+                    )
         except DeploymentError:
             inspection = None
-        schema_identity = (
-            None if inspection is None else database_content_identity(inspection)
-        )
+        schema_identity = None if inspection is None else inspection.identity
         active = {
             component: state.components[component].active for component in COMPONENTS
         }
@@ -1992,6 +3154,73 @@ class FixedObservationProvider:
             ),
             services=services,
         )
+
+    def _active_schema_target(self, state: DeploymentState) -> tuple[str, ...]:
+        """Reopen the active, natively admitted migration document, not all bundles.
+
+        Activation already verified this inventory against the candidate wheel
+        and migration graph. Read only its exact indexed bytes under the immutable
+        root-owned release; do not infer a schema from the operator's own version.
+        Full native verification remains the separate verify operation.
+        """
+        code = "DEPLOYMENT_CONTRACT_ADMISSION_FAILED"
+        try:
+            identity = state.components[PLATFORM].active
+            if identity is None:
+                raise ValueError
+            manifest = BundleStore(self.layout).read_installed_manifest(
+                PLATFORM,
+                identity,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            )
+            binding = next(
+                item
+                for item in manifest.contracts
+                if item.contract == "helixweave.platform.database-migrations"
+            )
+            record = next(item for item in manifest.files if item.path == binding.path)
+            root = self.layout.component_store(PLATFORM) / identity
+            path = root
+            for part in Path(binding.path).parts[:-1]:
+                path = path / part
+                observed = path.lstat()
+                if (
+                    not stat.S_ISDIR(observed.st_mode)
+                    or stat.S_IMODE(observed.st_mode) != 0o555
+                    or observed.st_uid != self.root_uid
+                    or observed.st_gid != self.root_gid
+                ):
+                    raise ValueError
+            content, observed = read_regular_file(
+                root / binding.path,
+                max_bytes=512 * 1024,
+                code=code,
+            )
+            digest = hashlib.sha256(content).hexdigest()
+            if (
+                len(content) != record.size_bytes
+                or digest != record.sha256
+                or binding.identity != f"sha256-{digest}"
+                or stat.S_IMODE(observed.st_mode) != record.mode
+                or record.mode != 0o444
+                or observed.st_uid != self.root_uid
+                or observed.st_gid != self.root_gid
+            ):
+                raise ValueError
+            inventory = json.loads(content, object_pairs_hook=_unique_object)
+            heads = inventory["heads"]
+            if (
+                inventory["inventory_id"] != "helixweave-platform-migrations"
+                or not isinstance(heads, list)
+                or len(heads) != 1
+                or not isinstance(heads[0], str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", heads[0]) is None
+            ):
+                raise ValueError
+            return tuple(heads)
+        except (OSError, ValueError, TypeError, KeyError, StopIteration):
+            raise fail(code, "Deployment contract admission failed.") from None
 
     def _read_state(self, expected_identity: str) -> DeploymentState:
         try:
@@ -2855,6 +4084,9 @@ class HostDeploymentActionController:
                     "action_receipt_identity": admission.identity,
                 },
             )
+            self._transfer_retained_redis(
+                journal.record, prior_state=state, restore=False
+            )
         self._restart_services(
             stopped,
             candidate=candidate,
@@ -2974,55 +4206,57 @@ class HostDeploymentActionController:
         self,
         record: OperatorTransaction,
     ) -> OperatorTransaction:
-        if (
-            record.component is not None
-            or record.prior_state_identity is None
-            or record.candidate_state_identity != record.prior_state_identity
-            or record.prior_active is None
-            or record.candidate_active != record.prior_active
-            or (record.operation == UNINSTALL) != (record.unit is None)
-            or (record.operation != UNINSTALL) != (record.unit is not None)
-            or (
-                record.operation == UNINSTALL
-                and (
-                    record.deployment_identity != record.prior_state_identity
-                    or record.restart_units != record.prior_running_units
-                )
-            )
-            or (
-                record.operation != UNINSTALL and record.restart_units != (record.unit,)
-            )
-            or (record.operation == START and record.prior_running_units)
-            or (
-                record.operation in {STOP, CLEANUP}
-                and record.prior_running_units != (record.unit,)
-            )
-        ):
-            raise fail(
-                "OPERATOR_RECOVERY_REQUIRED",
-                "Operator transaction requires recovery.",
-                recoverable=True,
-            )
-        with self.states.transaction(
-            exclusive=False,
-            expected_owner_uid=self.root_uid,
-            expected_owner_gid=self.root_gid,
-        ) as transaction:
-            state = transaction.read()
+        with _operator_phase("recovery-candidate-preflight", record):
             if (
-                transaction.pending_transactions()
-                or state.identity != record.prior_state_identity
-                or {
-                    component: state.components[component].active
-                    for component in COMPONENTS
-                }
-                != record.prior_active
+                record.component is not None
+                or record.prior_state_identity is None
+                or record.candidate_state_identity != record.prior_state_identity
+                or record.prior_active is None
+                or record.candidate_active != record.prior_active
+                or (record.operation == UNINSTALL) != (record.unit is None)
+                or (record.operation != UNINSTALL) != (record.unit is not None)
+                or (
+                    record.operation == UNINSTALL
+                    and (
+                        record.deployment_identity != record.prior_state_identity
+                        or record.restart_units != record.prior_running_units
+                    )
+                )
+                or (
+                    record.operation != UNINSTALL
+                    and record.restart_units != (record.unit,)
+                )
+                or (record.operation == START and record.prior_running_units)
+                or (
+                    record.operation in {STOP, CLEANUP}
+                    and record.prior_running_units != (record.unit,)
+                )
             ):
                 raise fail(
                     "OPERATOR_RECOVERY_REQUIRED",
                     "Operator transaction requires recovery.",
                     recoverable=True,
                 )
+            with self.states.transaction(
+                exclusive=False,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            ) as transaction:
+                state = transaction.read()
+                if (
+                    transaction.pending_transactions()
+                    or state.identity != record.prior_state_identity
+                    or {
+                        component: state.components[component].active
+                        for component in COMPONENTS
+                    }
+                    != record.prior_active
+                ):
+                    raise fail(
+                        "OPERATOR_RECOVERY_REQUIRED",
+                        "Operator transaction requires recovery.",
+                        recoverable=True,
+                    )
         if record.operation == UNINSTALL:
             self._recover_uninstall(record)
             return _terminal_recovery_record(record, phase="aborted")
@@ -3155,6 +4389,7 @@ class HostDeploymentActionController:
             expected_owner_uid=self.root_uid,
             expected_owner_gid=self.root_gid,
         )
+        self._recover_retained_redis(record, restore=True)
         for unit in record.prior_running_units:
             deployment = self._service_deployment(record.prior_active, unit)
             if deployment is None:
@@ -3181,39 +4416,42 @@ class HostDeploymentActionController:
 
     def _resume_candidate(self, record: OperatorTransaction) -> None:
         assert record.candidate_active is not None
-        self.states.recover_pending_transaction(
-            prior_state_identity=record.prior_state_identity,
-            candidate_state_identity=record.candidate_state_identity,
-            desired="complete-candidate",
-            expected_owner_uid=self.root_uid,
-            expected_owner_gid=self.root_gid,
-        )
-        if not self._database_exists():
-            raise fail(
-                "OPERATOR_RECOVERY_REQUIRED",
-                "Operator transaction requires recovery.",
-                recoverable=True,
+        with _operator_phase("recovery-state-selection", record):
+            self.states.recover_pending_transaction(
+                prior_state_identity=record.prior_state_identity,
+                candidate_state_identity=record.candidate_state_identity,
+                desired="complete-candidate",
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
             )
-        assert self.service_uid is not None
-        assert self.service_gid is not None
-        database = inspect_database(
-            self.layout.database,
-            expected_owner_uid=self.service_uid,
-            expected_owner_gid=self.service_gid,
-        )
-        expected_database_identity = (
-            record.schema_after_identity or record.source_database_identity
-        )
-        if (
-            expected_database_identity is None
-            or database_content_identity(database) != expected_database_identity
-            or database.schema_heads != record.target_schema_heads
-        ):
-            raise fail(
-                "OPERATOR_RECOVERY_REQUIRED",
-                "Operator transaction requires recovery.",
-                recoverable=True,
+        with _operator_phase("recovery-database-preflight", record):
+            if not self._database_exists():
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Operator transaction requires recovery.",
+                    recoverable=True,
+                )
+            assert self.service_uid is not None
+            assert self.service_gid is not None
+            database = inspect_database(
+                self.layout.database,
+                expected_owner_uid=self.service_uid,
+                expected_owner_gid=self.service_gid,
             )
+            expected_database_identity = (
+                record.schema_after_identity or record.source_database_identity
+            )
+            if (
+                expected_database_identity is None
+                or database_content_identity(database) != expected_database_identity
+                or database.schema_heads != record.target_schema_heads
+            ):
+                raise fail(
+                    "OPERATOR_RECOVERY_REQUIRED",
+                    "Operator transaction requires recovery.",
+                    recoverable=True,
+                )
+        self._recover_retained_redis(record, restore=False)
         for unit in record.restart_units:
             deployment = self._service_deployment(record.candidate_active, unit)
             if deployment is None:
@@ -3307,15 +4545,36 @@ class HostDeploymentActionController:
             deployment = self._service_deployment(active, unit)
             if deployment is not None and deployment not in deployments:
                 deployments.append(deployment)
+        mismatched = False
         for deployment in deployments:
-            observed = self._status_for_recovery(
-                unit=unit,
-                deployment_identity=deployment,
-                task_identity=record.task_identity,
-                tolerate_identity_mismatch=True,
-            )
+            try:
+                observed = self.services.status(
+                    OperatorRequest(
+                        operation=STATUS,
+                        unit=unit,
+                        deployment_identity=deployment,
+                        task_identity=record.task_identity,
+                    )
+                )
+            except DeploymentError as error:
+                if error.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH":
+                    mismatched = True
+                    continue
+                if error.issue.code != "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE":
+                    raise
+                observed = self._status_for_recovery(
+                    unit=unit,
+                    deployment_identity=deployment,
+                    task_identity=record.task_identity,
+                    tolerate_identity_mismatch=False,
+                )
             if observed is not None:
                 return deployment, observed
+        if mismatched:
+            raise fail(
+                "OPERATOR_SERVICE_IDENTITY_MISMATCH",
+                "Running service does not match either recovery slot.",
+            )
         return None
 
     def _restore_database_before_ponr(self, record: OperatorTransaction) -> None:
@@ -3514,14 +4773,20 @@ class HostDeploymentActionController:
             target_schema_heads = _candidate_schema_target(receipt)
             database_exists = self._database_exists()
             database = (
-                inspect_database(
+                observe_online_database(
                     self.layout.database,
                     expected_owner_uid=self.service_uid,
                     expected_owner_gid=self.service_gid,
+                    writer_uids=_online_database_writer_uids(),
                 )
                 if database_exists
                 else None
             )
+            if database is not None and database.schema_heads != target_schema_heads:
+                raise fail(
+                    "DEPLOYMENT_SCHEMA_INCOMPATIBLE",
+                    "Database schema is not compatible with the deployment.",
+                )
             native_checks = {
                 PLATFORM: "platform-native",
                 ENCODE_RUNTIME: "encode-runtime-native",
@@ -3552,7 +4817,7 @@ class HostDeploymentActionController:
                     "OPERATOR_ACTION_RECEIPT_INVALID",
                     "Operator action receipt is invalid.",
                 )
-            database_identity = database_content_identity(database)
+            database_identity = database.identity
             readiness = dict(receipt.readiness)
             readiness["database-schema"] = ReadinessCheck(
                 "ready", "READY", database_identity
@@ -4163,6 +5428,111 @@ class HostDeploymentActionController:
             )
         return receipt
 
+    def recover_retained_redis_start(
+        self, request: OperatorRequest, *, journal: OperatorJournalHandle
+    ) -> ServiceIdentity:
+        record = journal.record
+        with self.states.transaction(
+            exclusive=False,
+            expected_owner_uid=self.root_uid,
+            expected_owner_gid=self.root_gid,
+        ) as transaction:
+            current = transaction.read()
+            if (
+                transaction.pending_transactions()
+                or current.identity != record.candidate_state_identity
+                or {k: v.active for k, v in current.components.items()}
+                != record.candidate_active
+                or record.prior_state_identity is None
+            ):
+                raise fail(
+                    "OPERATOR_STATE_IDENTITY_MISMATCH",
+                    "Operator state identity does not match recovery.",
+                )
+            prior = self.states._load_generation_locked(
+                record.prior_state_identity,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            )
+            if (
+                {k: v.active for k, v in prior.components.items()}
+                != record.prior_active
+                or prior.components[PLATFORM].active is None
+                or current.components[PLATFORM].active != request.deployment_identity
+            ):
+                raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+            return self.services.recover_retained_redis_start(
+                request,
+                prior=prior.components[PLATFORM].active,
+                previous=prior.components[PLATFORM].previous,
+                journal=journal,
+            )
+
+    def _recover_retained_redis(
+        self, record: OperatorTransaction, *, restore: bool
+    ) -> None:
+        if "retained_redis_identity" not in record.evidence:
+            return  # Earlier journals did not transfer a retained Redis binding.
+        assert record.prior_state_identity is not None
+        with self.states.transaction(
+            exclusive=False,
+            expected_owner_uid=self.root_uid,
+            expected_owner_gid=self.root_gid,
+        ):
+            prior = self.states._load_generation_locked(
+                record.prior_state_identity,
+                expected_owner_uid=self.root_uid,
+                expected_owner_gid=self.root_gid,
+            )
+            if "retained_redis_replacement_intent" in record.evidence:
+                if (
+                    restore
+                    or record.component != PLATFORM
+                    or record.candidate_active is None
+                ):
+                    raise fail(
+                        "OPERATOR_JOURNAL_INVALID", "Operator journal is invalid."
+                    )
+                self.services.verify_redis_replacement(
+                    record,
+                    prior=prior.components[PLATFORM].active,
+                    candidate=record.candidate_active[PLATFORM],
+                )
+            else:
+                self._transfer_retained_redis(
+                    record, prior_state=prior, restore=restore
+                )
+
+    def _transfer_retained_redis(
+        self,
+        record: OperatorTransaction,
+        *,
+        prior_state: DeploymentState,
+        restore: bool,
+    ) -> None:
+        witness = record.evidence.get("retained_redis_identity")
+        if witness is None:
+            return
+        if (
+            record.component != PLATFORM
+            or record.prior_active is None
+            or record.candidate_active is None
+            or record.prior_state_identity != prior_state.identity
+            or record.prior_active[PLATFORM] != prior_state.components[PLATFORM].active
+            or "helixweave-redis.service" in record.restart_units
+        ):
+            raise fail("OPERATOR_JOURNAL_INVALID", "Operator journal is invalid.")
+        prior = record.prior_active[PLATFORM]
+        candidate = record.candidate_active[PLATFORM]
+        assert prior is not None and candidate is not None
+        self.services.transfer_redis_binding(
+            prior=prior,
+            candidate=candidate,
+            previous=prior_state.components[PLATFORM].previous,
+            witness=witness,
+            restore=restore,
+        )
+
     def _stop_affected_services(
         self,
         *,
@@ -4214,10 +5584,22 @@ class HostDeploymentActionController:
         prior_running_units = tuple(
             unit for unit in SERVICE_UNITS if values.get(unit) is not None
         )
+        retained = None
+        if component == PLATFORM and not start_initial and active_platform is not None:
+            next_platform = candidate.components[PLATFORM].active
+            assert next_platform is not None
+            retained = self.services.prepare_redis_transfer(
+                prior=active_platform,
+                candidate=next_platform,
+                previous=state.components[PLATFORM].previous,
+            )
         journal.advance(
             "service-stopping",
             restart_units=restart_units,
             prior_running_units=prior_running_units,
+            evidence={}
+            if retained is None
+            else {"retained_redis_identity": retained.identity},
         )
         for unit, service in values.items():
             if service is None:
@@ -4598,6 +5980,21 @@ class HostOperatorBackend:
                 "verified",
                 verification=_with_boundary_readiness(verification, boundary),
             )
+        if request.operation == START and request.unit == "helixweave-redis.service":
+            with self.journal_store.retained_redis_recovery(
+                task_identity=request.task_identity,
+                deployment_identity=request.deployment_identity,
+            ) as recovery:
+                if recovery is not None:
+                    with _operator_phase(
+                        "retained-redis-explicit-recovery", recovery.record
+                    ):
+                        service = (
+                            self.deployment_controller.recover_retained_redis_start(
+                                request, journal=recovery
+                            )
+                        )
+                    return OperatorOutcome("running", service=service)
         with self.journal_store.operation(
             operation=request.operation,
             task_identity=request.task_identity,
@@ -4637,7 +6034,7 @@ class HostOperatorBackend:
                 expected_mode=0o440,
                 expected_parent_uid=self.root_uid,
                 expected_parent_gid=group_gid,
-                expected_parent_mode=0o2730,
+                expected_parent_mode=0o2770,
                 expected_component=request.component,
                 expected_identity=request.deployment_identity,
                 installed_owner_uid=self.root_uid,
@@ -4800,7 +6197,7 @@ class HostOperatorBackend:
             boundaries = (
                 (self.layout.data_root / "operator", group_gid, 0o710),
                 (self.layout.ingress, group_gid, 0o750),
-                (path, group_gid, 0o2730),
+                (path, group_gid, 0o2770),
             )
             observed_boundaries = tuple(
                 (boundary.lstat(), expected_gid, expected_mode)
@@ -5199,7 +6596,8 @@ def execute_request(
         else None
     )
     try:
-        outcome = backend.execute(request, bundle_path=bundle_path)
+        with _operator_phase("operator-execute", request):
+            outcome = backend.execute(request, bundle_path=bundle_path)
     except DeploymentError as error:
         raise fail(
             "OPERATOR_OPERATION_FAILED",

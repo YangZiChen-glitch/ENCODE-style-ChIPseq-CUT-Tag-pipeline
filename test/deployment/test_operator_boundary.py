@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from contextlib import closing
 import errno
 import importlib.util
 import hashlib
@@ -27,9 +28,10 @@ from encode_pipeline.deployment.database import (
     database_content_identity,
     fresh_database_candidate_path,
     inspect_database,
+    observe_online_database,
 )
 from encode_pipeline.deployment.layout import DeploymentLayout
-from encode_pipeline.deployment.models import DeploymentState
+from encode_pipeline.deployment.models import BundleManifest, DeploymentState
 from encode_pipeline.deployment.operator import (
     CommandResult,
     FixedObservationProvider,
@@ -48,6 +50,7 @@ from encode_pipeline.deployment.operator import (
     SystemdBulkRuntimePreparer,
     UNINSTALL_BOUNDARY_FILES,
     UNINSTALL_LINKED_BOUNDARY_TARGETS,
+    WRITER_UNITS,
     ServiceIdentity,
     SocketWitness,
     bundle_ingress_path,
@@ -69,6 +72,7 @@ from encode_pipeline.deployment.operator_action import (
     DatabasePrepareReceipt,
     DatabasePrepareRequest,
     DeploymentActionReceipt,
+    DeploymentActionRequest,
     EncodeRuntimeEntry,
     EncodeRuntimeInventory,
     EncodeRuntimePrepareReceipt,
@@ -192,6 +196,32 @@ def _worker_service_identity() -> ServiceIdentity:
         invocation_identity=f"sha256-{'f' * 64}",
         cgroup_identity=f"sha256-{'1' * 64}",
         sockets=(),
+    )
+
+
+def _docker_service_identity(
+    unit: str = "helixweave-docker-rootless.service",
+) -> ServiceIdentity:
+    return ServiceIdentity.create(
+        unit=unit,
+        deployment_identity=IDENTITY,
+        task_identity=TASK_IDENTITY,
+        main_pid=1234,
+        process_start_ticks=5678,
+        executable_device=42,
+        executable_inode=84,
+        cmdline_identity=f"sha256-{'d' * 64}",
+        boot_identity=f"sha256-{'e' * 64}",
+        invocation_identity=f"sha256-{'f' * 64}",
+        cgroup_identity=f"sha256-{'1' * 64}",
+        sockets=(
+            SocketWitness(
+                name="api-http" if unit == "helixweave-api.service" else "bulk-docker",
+                device=41,
+                inode=84,
+                kernel_inode=4567,
+            ),
+        ),
     )
 
 
@@ -326,6 +356,10 @@ class FakeServiceController:
     service: ServiceIdentity | None = None
     stopped: tuple[str, bool] | None = None
 
+    def prepare_redis_transfer(self, **kwargs):
+        assert self.service is None or self.service.unit != "helixweave-redis.service"
+        return None
+
     def start(self, request: OperatorRequest) -> ServiceIdentity:
         assert self.service is not None
         return self.service
@@ -376,7 +410,7 @@ def _operator_ingress(layout: DeploymentLayout, component: str) -> Path:
     path.mkdir(parents=True)
     (layout.data_root / "operator").chmod(0o710)
     layout.ingress.chmod(0o750)
-    path.chmod(0o2730)
+    path.chmod(0o2770)
     return path
 
 
@@ -480,6 +514,32 @@ def test_host_backend_stages_only_the_requested_flat_manifest_identity(
     journal = layout.operator_transaction_history / f"{TASK_IDENTITY}.json"
     assert json.loads(journal.read_text())["phase"] == "complete"
     assert not layout.operator_transaction_active.exists()
+
+
+def test_host_backend_rejects_legacy_ingress_mode_before_staging(
+    tmp_path: Path,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    manifest, payload = manifest_for("encode-runtime")
+    ingress = _operator_ingress(layout, manifest.component)
+    ingress.chmod(0o2730)
+    bundle = write_bundle(
+        layout.ingress_bundle(manifest.component, manifest.identity),
+        manifest,
+        payload,
+    )
+    bundle.chmod(0o440)
+
+    with pytest.raises(DeploymentError) as captured:
+        _host_backend(layout).execute(
+            parse_request(
+                ("stage", manifest.component, manifest.identity, TASK_IDENTITY)
+            ),
+            bundle_path=bundle,
+        )
+
+    assert captured.value.issue.code == "OPERATOR_INGRESS_UNTRUSTED"
+    assert not (layout.component_store(manifest.component) / manifest.identity).exists()
 
 
 def test_host_backend_fsyncs_service_start_point_of_no_return_before_start(
@@ -736,11 +796,24 @@ def test_systemctl_observation_fails_closed_until_daemon_reload_completes() -> N
     assert "NeedDaemonReload" in executor.calls[0][0][4]
 
 
+@pytest.mark.parametrize(
+    "unit",
+    (
+        "helixweave-worker.service",
+        "helixweave-api.service",
+        "helixweave-docker-rootless.service",
+    ),
+)
 def test_service_start_stops_synchronously_when_identity_persistence_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unit: str,
 ) -> None:
-    service = _worker_service_identity()
+    service = (
+        _worker_service_identity()
+        if unit == "helixweave-worker.service"
+        else _docker_service_identity(unit)
+    )
 
     class SequencedProbe:
         def __init__(self) -> None:
@@ -757,6 +830,10 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
             self.calls.append((action, unit))
 
     systemctl = RecordingSystemctl()
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
     controller = SystemdServiceController(
         DeploymentLayout.isolated(tmp_path / "host"),
         systemctl=systemctl,
@@ -776,7 +853,7 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
         controller.start(
             OperatorRequest(
                 operation="start",
-                unit="helixweave-worker.service",
+                unit=unit,
                 deployment_identity=IDENTITY,
                 task_identity=TASK_IDENTITY,
             )
@@ -784,9 +861,284 @@ def test_service_start_stops_synchronously_when_identity_persistence_fails(
 
     assert captured.value.issue.code == "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"
     assert systemctl.calls == [
-        ("start", "helixweave-worker.service"),
-        ("stop", "helixweave-worker.service"),
+        ("start", unit),
+        ("stop", unit),
     ]
+    diagnostics = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    failures = [d for d in diagnostics if d["status"] == "failure"]
+    assert [(d["phase"], d["code"]) for d in failures] == [
+        ("identity-persist", "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"),
+    ]
+    assert all(d["unit"] == unit for d in diagnostics)
+    assert all(d["task_identity"] == TASK_IDENTITY for d in diagnostics)
+    assert diagnostics[-1]["phase"] == "persist-cleanup-observe"
+    assert diagnostics[-1]["status"] == "success"
+
+
+def test_persist_and_cleanup_failures_are_logged_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    service = _worker_service_identity()
+    controller = SystemdServiceController(DeploymentLayout.isolated(tmp_path))
+
+    def broken_write(_service):
+        raise fail("OPERATOR_SERVICE_IDENTITY_UNAVAILABLE", "private write details")
+
+    def broken_stop(*_args):
+        raise fail("OPERATOR_SYSTEMCTL_FAILED", "private stop details")
+
+    monkeypatch.setattr(controller, "_write_identity", broken_write)
+    monkeypatch.setattr(controller.systemctl, "control", broken_stop)
+    with pytest.raises(DeploymentError) as caught:
+        controller._persist_started_service(service)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_RECOVERY_REQUIRED"
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    assert [(r["phase"], r["code"]) for r in records if r["status"] == "failure"] == [
+        ("identity-persist", "OPERATOR_SERVICE_IDENTITY_UNAVAILABLE"),
+        ("persist-cleanup-stop", "OPERATOR_SYSTEMCTL_FAILED"),
+    ]
+    assert "private" not in "".join(logs)
+
+
+def test_rootless_docker_start_waits_for_full_service_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _docker_service_identity()
+
+    class PendingThenReadyProbe:
+        starting_calls = 0
+
+        def observe(self, **_kwargs):
+            return None
+
+        def observe_starting(self, **_kwargs):
+            self.starting_calls += 1
+            if self.starting_calls < 3:
+                raise operator_module._ServiceReadinessPending(
+                    (
+                        service.main_pid,
+                        service.process_start_ticks,
+                        service.invocation_identity,
+                        service.boot_identity,
+                    )
+                )
+            return service
+
+    class RecordingSystemctl:
+        calls: list[tuple[str, str]] = []
+
+        def control(self, action: str, unit: str) -> None:
+            self.calls.append((action, unit))
+
+    now = [100.0]
+    sleeps: list[float] = []
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+
+    def advance(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    persisted: list[ServiceIdentity] = []
+    probe = PendingThenReadyProbe()
+    systemctl = RecordingSystemctl()
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        systemctl=systemctl,
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+
+    observed = controller.start(
+        OperatorRequest(
+            operation="start",
+            unit="helixweave-docker-rootless.service",
+            deployment_identity=IDENTITY,
+            task_identity=TASK_IDENTITY,
+        )
+    )
+
+    assert observed == service
+    assert probe.starting_calls == 3
+    assert systemctl.calls == [("start", "helixweave-docker-rootless.service")]
+    assert sleeps == [0.1, 0.1]
+    assert persisted == [service]
+
+
+@pytest.mark.parametrize("unit", operator_module._READINESS_UNITS)
+def test_socket_service_start_readiness_wait_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unit: str,
+) -> None:
+    class PendingProbe:
+        starting_calls = 0
+
+        def observe(self, **_kwargs):
+            return None
+
+        def observe_starting(self, **_kwargs):
+            self.starting_calls += 1
+            raise operator_module._ServiceReadinessPending(
+                (123, 456, IDENTITY, IDENTITY), entry_stages=(0, 0)
+            )
+
+    class RecordingSystemctl:
+        calls: list[tuple[str, str]] = []
+
+        def control(self, action: str, unit: str) -> None:
+            self.calls.append((action, unit))
+            now[0] += 5.0
+
+    now = [0.0]
+    sleeps: list[float] = []
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+
+    def advance(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    persisted: list[ServiceIdentity] = []
+    probe = PendingProbe()
+    systemctl = RecordingSystemctl()
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        systemctl=systemctl,
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+
+    with pytest.raises(DeploymentError) as captured:
+        controller.start(
+            OperatorRequest(
+                operation="start",
+                unit=unit,
+                deployment_identity=IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+        )
+
+    assert captured.value.issue.code == "OPERATOR_SERVICE_START_FAILED"
+    assert probe.starting_calls > 1
+    assert sum(sleeps) == pytest.approx(10.0)
+    assert now[0] == pytest.approx(15.0)
+    assert all(0 < delay <= 0.1 for delay in sleeps)
+    assert systemctl.calls == [("start", unit)]
+    assert persisted == []
+
+
+@pytest.mark.parametrize("unit", operator_module._READINESS_UNITS)
+def test_socket_service_start_does_not_retry_hard_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unit: str,
+) -> None:
+    class HardFailureProbe:
+        starting_calls = 0
+
+        def observe(self, **_kwargs):
+            return None
+
+        def observe_starting(self, **_kwargs):
+            self.starting_calls += 1
+            raise fail(
+                "OPERATOR_SERVICE_OBSERVE_FAILED",
+                "Service identity could not be observed.",
+            )
+
+    probe = HardFailureProbe()
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        systemctl=SimpleNamespace(control=lambda *_args: None),
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    monkeypatch.setattr(
+        operator_module.time,
+        "sleep",
+        lambda _delay: pytest.fail("hard identity failure was retried"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_write_identity",
+        lambda _service: pytest.fail("invalid service identity was persisted"),
+    )
+
+    with pytest.raises(DeploymentError) as captured:
+        controller.start(
+            OperatorRequest(
+                operation="start",
+                unit=unit,
+                deployment_identity=IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+        )
+
+    assert captured.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+    assert probe.starting_calls == 1
+
+
+def test_redis_start_keeps_single_observation_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "helixweave-redis.service"
+    fields = _worker_service_identity().to_dict()
+    for key in ("identity", "unit", "sockets"):
+        fields.pop(key)
+    service = ServiceIdentity.create(
+        **fields, unit=unit, sockets=(SocketWitness("redis-queue", 1, 2, 3),)
+    )
+
+    class SequencedProbe:
+        observe_calls = 0
+
+        def observe(self, **_kwargs):
+            self.observe_calls += 1
+            return None if self.observe_calls == 1 else service
+
+        def observe_starting(self, **_kwargs):
+            pytest.fail("Redis start used readiness polling")
+
+    probe = SequencedProbe()
+    persisted: list[ServiceIdentity] = []
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        systemctl=SimpleNamespace(control=lambda *_args: None),
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    monkeypatch.setattr(
+        operator_module.time,
+        "sleep",
+        lambda _delay: pytest.fail("non-Docker start slept"),
+    )
+
+    observed = controller.start(
+        OperatorRequest(
+            operation="start",
+            unit=unit,
+            deployment_identity=IDENTITY,
+            task_identity=TASK_IDENTITY,
+        )
+    )
+
+    assert observed == service
+    assert probe.observe_calls == 2
+    assert persisted == [service]
 
 
 def test_cleanup_recovery_resets_failed_unit_after_stop_already_completed(
@@ -832,6 +1184,65 @@ def test_cleanup_recovery_resets_failed_unit_after_stop_already_completed(
     )
 
     assert systemctl.calls == [("reset-failed", "helixweave-worker.service")]
+
+
+def test_service_status_ignores_stale_identity_only_after_confirming_stopped(
+    tmp_path: Path,
+) -> None:
+    prior = _worker_service_identity()
+
+    class Probe:
+        running = False
+
+        def observe(
+            self,
+            *,
+            unit: str,
+            deployment_identity: str,
+            task_identity: str,
+        ) -> ServiceIdentity | None:
+            if not self.running:
+                return None
+            return ServiceIdentity.create(
+                unit=unit,
+                deployment_identity=deployment_identity,
+                task_identity=task_identity,
+                main_pid=1234,
+                process_start_ticks=5678,
+                executable_device=42,
+                executable_inode=84,
+                cmdline_identity=OLD_PLATFORM_IDENTITY,
+                boot_identity=OLD_ENCODE_IDENTITY,
+                invocation_identity=OLD_BULK_IDENTITY,
+                cgroup_identity=THIRD_IDENTITY,
+                sockets=(),
+            )
+
+    probe = Probe()
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    layout.service_identities.mkdir(parents=True, mode=0o700)
+    layout.service_identities.chmod(0o700)
+    controller = SystemdServiceController(
+        layout,
+        systemctl=SimpleNamespace(),
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    controller._write_identity(prior)
+    request = OperatorRequest(
+        operation="status",
+        unit=prior.unit,
+        deployment_identity=OLD_PLATFORM_IDENTITY,
+        task_identity=f"task-{'d' * 32}",
+    )
+
+    assert controller.status(request) is None
+
+    probe.running = True
+    with pytest.raises(DeploymentError) as captured:
+        controller.status(request)
+    assert captured.value.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH"
 
 
 def test_uninstall_removes_only_fixed_boundary_and_preserves_data(
@@ -1052,10 +1463,18 @@ def test_bootstrap_repairs_a_post_commit_partial_uninstall_without_journal_deadl
     "error",
     [
         RuntimeError("/private/reference secret=value"),
+        PermissionError(errno.EACCES, "/private/reference secret=value"),
         fail("BACKEND_PRIVATE", "/private/reference secret=value"),
     ],
 )
-def test_backend_errors_are_replaced_by_one_redacted_failure(error: Exception) -> None:
+def test_backend_errors_are_replaced_by_one_redacted_failure(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+
     class FailingBackend:
         def execute(self, request, *, bundle_path):
             del request, bundle_path
@@ -1071,6 +1490,27 @@ def test_backend_errors_are_replaced_by_one_redacted_failure(error: Exception) -
     assert caught.value.issue.message == "Operator action failed."
     assert "private" not in str(caught.value)
     assert "secret" not in str(caught.value)
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    diagnostic = records[-1]
+    assert diagnostic["phase"] == "operator-execute"
+    assert diagnostic["status"] == "failure"
+    assert diagnostic["error_type"] == type(error).__name__
+    assert diagnostic["task_identity"] == TASK_IDENTITY
+    if isinstance(error, DeploymentError):
+        assert diagnostic["code"] == error.issue.code
+    elif isinstance(error, OSError):
+        assert diagnostic["errno"] == errno.EACCES
+    assert "private" not in "".join(logs) and "secret" not in "".join(logs)
+
+    def broken_log(*_args):
+        raise RuntimeError("logging unavailable")
+
+    monkeypatch.setattr(operator_module.syslog, "syslog", broken_log)
+    with pytest.raises(DeploymentError) as again:
+        execute_request(
+            ("stage", "platform", IDENTITY, TASK_IDENTITY), backend=FailingBackend()
+        )
+    assert again.value.issue == caught.value.issue
 
 
 def test_start_receipt_binds_task_process_executable_cmdline_and_socket_contract() -> (
@@ -1236,6 +1676,1117 @@ def test_linux_service_probe_binds_filesystem_and_kernel_socket_inodes(
     )
 
 
+@pytest.mark.parametrize("connected_first", (True, False))
+def test_unix_listener_ignores_connected_rows_without_changing_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    connected_first: bool,
+) -> None:
+    probe, path = _unix_socket_probe(tmp_path)
+    table = probe.proc_root / "net/unix"
+    header, listener = table.read_text().splitlines()
+    connected = f"00000000: 00000003 00000000 00000000 0001 03 9999 {path}"
+    records = [connected, listener] if connected_first else [listener, connected]
+    table.write_text("\n".join([header, *records]) + "\n")
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+
+    witnesses = probe._socket_witnesses(
+        unit="helixweave-redis.service",
+        cgroup="/system.slice/helixweave-redis.service",
+        main_pid=123,
+    )
+
+    assert witnesses == (SocketWitness("redis-queue", 41, 84, 4567),)
+    assert json.loads(logs[-1].split(" ", 1)[1]) == {
+        "phase": "unix-listener",
+        "code": "OK",
+        "unit": "helixweave-redis.service",
+    }
+    assert str(path) not in "".join(logs)
+
+
+@pytest.mark.parametrize(
+    "case", ("connected-only", "two-listeners", "bad-connected-inode")
+)
+def test_unix_connected_rows_do_not_weaken_unique_listener_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    probe, path = _unix_socket_probe(tmp_path)
+    table = probe.proc_root / "net/unix"
+    header, listener = table.read_text().splitlines()
+    connected = f"00000000: 00000003 00000000 00000000 0001 03 9999 {path}"
+    rows = {
+        "connected-only": [connected],
+        "two-listeners": [listener, listener.replace("4567", "5678"), connected],
+        "bad-connected-inode": [listener, connected.replace("9999", "0")],
+    }
+    table.write_text("\n".join([header, *rows[case]]) + "\n")
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    with pytest.raises(DeploymentError) as caught:
+        probe._socket_witnesses(
+            unit="helixweave-redis.service",
+            cgroup="/system.slice/helixweave-redis.service",
+            main_pid=123,
+        )
+    assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+    assert (
+        json.loads(logs[-1].split(" ", 1)[1])["code"]
+        == {
+            "connected-only": "LISTENER_MISSING",
+            "two-listeners": "LISTENER_AMBIGUOUS",
+            "bad-connected-inode": "UNIX_SOCKET_ROW_INVALID",
+        }[case]
+    )
+
+
+def test_status_diagnostic_identifies_mismatch_without_rebinding_or_leaking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = _worker_service_identity()
+    values = saved.to_dict()
+    values.pop("identity")
+    values["main_pid"] += 1
+    observed = ServiceIdentity.create(**values)
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path),
+        probe=SimpleNamespace(observe=lambda **_kw: observed),
+    )
+    monkeypatch.setattr(controller, "_read_identity", lambda *_a, **_kw: saved)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda *_a: pytest.fail("status wrote identity")
+    )
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    request = OperatorRequest(
+        operation="status",
+        unit=saved.unit,
+        deployment_identity=saved.deployment_identity,
+        task_identity=TASK_IDENTITY,
+    )
+    with pytest.raises(DeploymentError) as caught:
+        controller.status(request)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH"
+    assert json.loads(logs[-1].split(" ", 1)[1]) == {
+        "phase": "service-identity",
+        "code": "IDENTITY_MISMATCH",
+        "unit": saved.unit,
+        "task_identity": TASK_IDENTITY,
+        "differing_fields": ["identity", "main_pid"],
+    }
+
+    # Logging is not part of the identity authority or the error outcome.
+    def unavailable_log(*_args):
+        raise OSError("/private/token=secret")
+
+    monkeypatch.setattr(operator_module.syslog, "syslog", unavailable_log)
+    with pytest.raises(DeploymentError) as caught:
+        controller.status(request)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_IDENTITY_MISMATCH"
+    assert "secret" not in str(caught.value)
+
+
+def _api_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    probe, _ = _unix_socket_probe(tmp_path)
+    unit = "helixweave-api.service"
+    group = probe.cgroup_root / "system.slice" / unit
+    group.mkdir()
+    (group / "cgroup.procs").write_text("123\n")
+    process = probe.proc_root / "123"
+    (process / "stat").write_bytes(b"123 (python) " + b"0 " * 19 + b"5678\n")
+    (process / "cmdline").write_bytes(b"python\x00-m\x00encode_pipeline\x00api\x00")
+    (process / "exe").symlink_to(Path(sys.executable).resolve())
+    (process / "status").write_text("Uid:\t997 997 997 997\nGid:\t456 456 456 456\n")
+    monkeypatch.setattr(
+        operator_module.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=997, pw_gid=987),
+    )
+    monkeypatch.setattr(
+        operator_module.grp, "getgrnam", lambda _name: SimpleNamespace(gr_gid=456)
+    )
+    forms = tuple(
+        (command, (process / "exe").stat())
+        for command in (
+            b"verified-api-dispatcher\0",
+            b"verified-api-launcher\0",
+            (process / "cmdline").read_bytes(),
+        )
+    )
+    monkeypatch.setattr(
+        probe,
+        "_candidate_launch_forms",
+        lambda identity, command: (
+            forms if identity == IDENTITY and command == "api" else ()
+        ),
+    )
+    boot = probe.proc_root / "sys/kernel/random/boot_id"
+    boot.parent.mkdir(parents=True)
+    boot.write_text("00112233-4455-6677-8899-aabbccddeeff\n")
+    (probe.proc_root / "net/tcp").write_text("header\n")
+    (probe.proc_root / "net/tcp6").write_text("header\n")
+    values = dict(
+        ActiveState="inactive",
+        SubState="dead",
+        MainPID="0",
+        InvocationID="a" * 32,
+        ControlGroup=f"/system.slice/{unit}",
+        NeedDaemonReload="no",
+    )
+
+    def control(action, name):
+        assert (action, name) == ("start", unit)
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+
+    systemctl = SimpleNamespace(control=control, show=lambda _unit: dict(values))
+    probe.systemctl = systemctl
+    monkeypatch.setattr(
+        probe,
+        "_cgroup_socket_stat",
+        lambda *_args, **_kwargs: SimpleNamespace(st_dev=41, st_ino=4567),
+    )
+    controller = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        systemctl=systemctl,
+        probe=probe,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    request = OperatorRequest(
+        operation="start",
+        unit=unit,
+        deployment_identity=IDENTITY,
+        task_identity=TASK_IDENTITY,
+    )
+    return controller, probe, request, values
+
+
+def test_api_observe_failure_is_distinct_from_persist_and_public_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, probe, request, _values = _api_start_probe(tmp_path, monkeypatch)
+    logs = []
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    error = fail("OPERATOR_SERVICE_OBSERVE_FAILED", "private detail")
+
+    def observe(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(probe, "observe_starting", observe)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persist called")
+    )
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value is error
+    records = [json.loads(line.split(" ", 1)[1]) for line in logs]
+    failures = [r for r in records if r.get("status") == "failure"]
+    assert [(r["phase"], r["code"]) for r in failures] == [
+        ("strong-observe", "OPERATOR_SERVICE_OBSERVE_FAILED")
+    ]
+    assert failures[0]["unit"] == request.unit
+    assert failures[0]["task_identity"] == request.task_identity
+    assert not any(r["phase"].startswith("identity-persist") for r in records)
+    assert "private" not in "".join(logs)
+
+
+def test_api_start_waits_for_same_invocation_then_persists_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, probe, request, _ = _api_start_probe(tmp_path, monkeypatch)
+    persisted = []
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+
+    def ready(delay):
+        assert delay == 0.1
+        assert persisted == []
+        now[0] += delay
+        (probe.proc_root / "net/tcp").write_text(
+            "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+        )
+
+    monkeypatch.setattr(operator_module.time, "sleep", ready)
+    observed = controller.start(request)
+    assert persisted == [observed]
+    assert now[0] == 0.1
+    assert observed.main_pid == 123
+    assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
+
+
+@pytest.mark.parametrize("case", ("changed-fields", "invalid-stat", "logging-failure"))
+def test_rejected_observe_diagnoses_the_same_snapshots_without_retry_or_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+    process = probe.proc_root / "123"
+    executable = (process / "exe").stat()
+    witness_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    final_executable = SimpleNamespace(
+        **{
+            k: getattr(executable, k) + (1 if case == "changed-fields" else 0)
+            for k in witness_fields
+        }
+    )
+    snapshots = []
+    read_counts = {}
+    original_read = Path.read_bytes
+    original_stat = Path.stat
+
+    def captured_stat(path, *args, **kwargs):
+        if path == process / "exe":
+            snapshots.append(path)
+            assert len(snapshots) <= 2, "diagnostic re-read executable"
+            return executable if len(snapshots) == 1 else final_executable
+        return original_stat(path, *args, **kwargs)
+
+    def captured_read(path):
+        if path in (process / "stat", process / "cmdline"):
+            read_counts[path.name] = read_counts.get(path.name, 0) + 1
+            assert read_counts[path.name] <= 2, "diagnostic re-read process"
+        return original_read(path)
+
+    def socket_observation(**_kwargs):
+        if case == "changed-fields":
+            values.update(
+                ActiveState="activating",
+                SubState="start",
+                MainPID="456",
+                InvocationID="b" * 32,
+                ControlGroup="/private/secret",
+                NeedDaemonReload="yes",
+            )
+            (process / "stat").write_bytes(b"123 (python) " + b"0 " * 19 + b"9999\n")
+        elif case == "invalid-stat":
+            (process / "stat").write_bytes(b") " + b"0 " * 19 + b"5678\n")
+        if case != "invalid-stat":
+            (process / "cmdline").write_bytes(b"/private/secret\0")
+        return (SocketWitness("api-http", 41, 4567, 4567),)
+
+    candidate_forms = probe._candidate_launch_forms(IDENTITY, "api")
+    form_reads = []
+
+    def unavailable_forms(*_args):
+        form_reads.append(True)
+        if len(form_reads) == 1:
+            return candidate_forms
+        raise RuntimeError("/private/secret")
+
+    monkeypatch.setattr(Path, "stat", captured_stat)
+    monkeypatch.setattr(Path, "read_bytes", captured_read)
+    monkeypatch.setattr(probe, "_socket_witnesses", socket_observation)
+    monkeypatch.setattr(probe, "_candidate_launch_forms", unavailable_forms)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    monkeypatch.setattr(
+        operator_module.time, "sleep", lambda _s: pytest.fail("retried")
+    )
+    logs = []
+
+    def log(_priority, text):
+        if case == "logging-failure":
+            raise ValueError("secret log failure")
+        logs.append(text)
+
+    monkeypatch.setattr(operator_module.syslog, "syslog", log)
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+    assert "secret" not in str(caught.value)
+    assert read_counts == {"stat": 2, "cmdline": 2} and len(snapshots) == 2
+    if case == "logging-failure":
+        return
+    record = next(
+        json.loads(s.split(" ", 1)[1])
+        for s in logs
+        if json.loads(s.split(" ", 1)[1])["phase"] == "process-stability"
+    )
+    expected = (
+        ["systemd." + k for k in FixedSystemctl._SHOW_PROPERTIES]
+        + ["process_start_ticks"]
+        + ["executable." + k for k in witness_fields]
+        + ["cmdline"]
+        if case == "changed-fields"
+        else ["stat_parse_validity"]
+    )
+    assert record["changed_fields"] == expected
+    assert record["stat_parse_validity"] == {
+        "before": True,
+        "after": case != "invalid-stat",
+    }
+    assert record["launcher_forms"] == {"before": "unknown", "after": "unknown"}
+    assert "secret" not in "".join(logs)
+
+
+def _docker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+    unit = "helixweave-docker-rootless.service"
+    group = probe.cgroup_root / "system.slice" / unit
+    group.mkdir()
+    (group / "cgroup.procs").write_text("123\n")
+    values["ControlGroup"] = f"/system.slice/{unit}"
+    probe.unix_sockets[unit] = probe.unix_sockets["helixweave-redis.service"]
+    process = probe.proc_root / "123"
+    uid, gid = os.getuid(), os.getgid()
+    (process / "status").write_text(
+        f"Uid:\t{uid} {uid} {uid} {uid}\nGid:\t{gid} {gid} {gid} {gid}\n"
+    )
+    monkeypatch.setattr(
+        operator_module.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=uid, pw_gid=gid),
+    )
+    forms = (
+        ((b"fixed-rootless-script\0",), Path(sys.executable).stat()),
+        (((process / "cmdline").read_bytes(),), Path(sys.executable).stat()),
+    )
+    monkeypatch.setattr(probe, "_docker_launch_forms", lambda: forms)
+
+    def control(action, name):
+        assert (action, name) == ("start", unit)
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+
+    controller.systemctl.control = control
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        operator_module.time, "sleep", lambda d: now.__setitem__(0, now[0] + d)
+    )
+    return controller, probe, replace(request, unit=unit), values, now
+
+
+@pytest.mark.parametrize("during_observation", (False, True))
+def test_docker_start_accepts_only_verified_script_to_rootlesskit_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during_observation: bool
+) -> None:
+    controller, probe, request, _values, now = _docker_start_probe(
+        tmp_path, monkeypatch
+    )
+    process = probe.proc_root / "123"
+    shell = tmp_path / "shell"
+    shell.write_bytes(b"fixed-shell")
+    forms = (
+        ((b"fixed-rootless-script\0",), shell.stat()),
+        ((b"fixed-rootlesskit-parent\0",), Path(sys.executable).stat()),
+    )
+    monkeypatch.setattr(probe, "_docker_launch_forms", lambda: forms)
+
+    def set_stage(stage):
+        (process / "exe").unlink()
+        (process / "exe").symlink_to(
+            shell if stage == 0 else Path(sys.executable).resolve()
+        )
+        (process / "cmdline").write_bytes(forms[stage][0][0])
+
+    set_stage(0)
+    original = probe._socket_witnesses
+    observations = []
+
+    def sockets(**kwargs):
+        observations.append(1)
+        if during_observation:
+            set_stage(1)
+        return original(**kwargs)
+
+    monkeypatch.setattr(probe, "_socket_witnesses", sockets)
+
+    def advance(delay):
+        now[0] += delay
+        set_stage(1)
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    saved = []
+    monkeypatch.setattr(controller, "_write_identity", saved.append)
+    result = controller.start(request)
+    assert saved == [result] and len(observations) == 2
+    assert result.cmdline_identity == operator_module._bytes_identity(forms[1][0][0])
+    assert result.main_pid == 123 and result.process_start_ticks == 5678
+    assert now[0] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("case", ("unknown", "restart", "timeout", "status-exec"))
+def test_docker_exec_readiness_does_not_accept_unknown_or_unstable_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    controller, probe, request, values, now = _docker_start_probe(tmp_path, monkeypatch)
+    process = probe.proc_root / "123"
+    forms = (
+        ((b"fixed-rootless-script\0",), Path(sys.executable).stat()),
+        ((b"fixed-rootlesskit-parent\0",), Path(sys.executable).stat()),
+    )
+    monkeypatch.setattr(probe, "_docker_launch_forms", lambda: forms)
+    (process / "cmdline").write_bytes(
+        b"unknown\0" if case == "unknown" else forms[0][0][0]
+    )
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _v: pytest.fail("persisted")
+    )
+
+    def advance(delay):
+        assert case in {"restart", "timeout"}, "hard failure retried"
+        now[0] += delay
+        if case == "restart":
+            values["InvocationID"] = "b" * 32
+            (process / "cmdline").write_bytes(forms[1][0][0])
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    if case == "status-exec":
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+        original = probe._socket_witnesses
+
+        def sockets(**kwargs):
+            (process / "cmdline").write_bytes(forms[1][0][0])
+            return original(**kwargs)
+
+        monkeypatch.setattr(probe, "_socket_witnesses", sockets)
+    with pytest.raises(DeploymentError) as caught:
+        if case == "status-exec":
+            probe.observe(
+                unit=request.unit,
+                deployment_identity=IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+        else:
+            controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if case == "timeout"
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    assert now[0] == pytest.approx(
+        15.0 if case == "timeout" else 0.1 if case == "restart" else 0
+    )
+
+
+def test_docker_launch_forms_come_from_verified_script_and_shipped_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe, _ = _unix_socket_probe(tmp_path)
+    script = b"#!/bin/sh\n# fixed fixture\n"
+    unit = (TEMPLATES / "helixweave-docker-rootless.service").read_bytes()
+    witness = SimpleNamespace(st_mode=stat.S_IFREG | 0o555, st_uid=0, st_gid=0)
+    monkeypatch.setattr(
+        operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
+    )
+    monkeypatch.setattr(
+        operator_module,
+        "_DOCKER_ROOTLESS_SCRIPT_SHA256",
+        hashlib.sha256(script).hexdigest(),
+    )
+    monkeypatch.setattr(
+        operator_module,
+        "read_regular_file",
+        lambda path, **_kw: (
+            script if str(path) == "/usr/bin/dockerd-rootless.sh" else unit,
+            witness,
+        ),
+    )
+    original = Path.stat
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda path, *a, **kw: (
+            witness
+            if str(path) in {"/bin/sh", "/usr/bin/rootlesskit"}
+            else original(path, *a, **kw)
+        ),
+    )
+    forms = probe._docker_launch_forms()
+    assert len(forms) == 2 and len(forms[0][0]) == 1 and len(forms[1][0]) == 4
+    assert forms[0][0][0].startswith(b"/bin/sh\0/usr/bin/dockerd-rootless.sh\0")
+    assert all(
+        c.startswith(
+            b"rootlesskit\0--state-dir=/run/helixweave/docker/dockerd-rootless\0"
+        )
+        and c.endswith(b"--group=0\0")
+        for c in forms[1][0]
+    )
+    assert any(b"--net=gvisor-tap-vsock\0--mtu=65520\0" in c for c in forms[1][0])
+    monkeypatch.setattr(operator_module, "_DOCKER_ROOTLESS_SCRIPT_SHA256", "0" * 64)
+    with pytest.raises(OSError):
+        probe._docker_launch_forms()
+
+
+@pytest.mark.parametrize("boundary", ("fd", "pid-directory"))
+def test_docker_proc_enoent_repeats_full_observation_before_persisting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    controller, probe, request, _, now = _docker_start_probe(tmp_path, monkeypatch)
+    operation = "readlink" if boundary == "fd" else "scandir"
+    original = getattr(os, operation)
+    scans = []
+    logs = []
+    persisted = []
+
+    def vanishing(path, *args, **kwargs):
+        if str(path).startswith(str(probe.proc_root / "123/fd")):
+            scans.append(path)
+            if len(scans) == 1:
+                raise FileNotFoundError(errno.ENOENT, "private path must not be logged")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, operation, vanishing)
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _priority, text: logs.append(text)
+    )
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    service = controller.start(request)
+    assert len(scans) == 2 and now[0] == 0.1
+    assert persisted == [service]
+    assert service.main_pid == 123 and service.process_start_ticks == 5678
+    assert service.sockets == (SocketWitness("bulk-docker", 41, 84, 4567),)
+    diagnostics = [
+        json.loads(line.split(" ", 1)[1])
+        for line in logs
+        if line.startswith("helixweave-operator-phase ")
+    ]
+    assert [
+        (d["phase"], d["status"]) for d in diagnostics if d["status"] != "begin"
+    ] == [
+        ("start-preflight-observe", "success"),
+        ("systemctl-start", "success"),
+        ("strong-observe", "success"),
+        ("identity-persist", "success"),
+    ]
+    assert "private" not in "".join(logs)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "deadline",
+        "permission",
+        "restart",
+        "start-time",
+        "exit",
+        "main-missing",
+        "socket-swap",
+        "other-missing",
+    ),
+)
+def test_docker_proc_scan_failure_is_narrow_and_process_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    controller, probe, request, values, now = _docker_start_probe(tmp_path, monkeypatch)
+    original = os.readlink
+    calls = []
+    logs = []
+
+    def missing(path, *args, **kwargs):
+        if str(path).startswith(str(probe.proc_root / "123/fd")):
+            calls.append(path)
+            if failure == "main-missing":
+                (probe.proc_root / "123/stat").unlink()
+            if failure == "permission":
+                raise PermissionError(errno.EACCES, "private")
+            raise FileNotFoundError(errno.ENOENT, "private")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", missing)
+    if failure == "other-missing":
+        (probe.proc_root / "net/unix").unlink()
+    elif failure == "socket-swap":
+        original_stat = probe.filesystem_socket_stat
+
+        def swapped(path):
+            value = original_stat(path)
+            return SimpleNamespace(
+                **{**vars(value), "st_ino": value.st_ino + len(calls)}
+            )
+
+        monkeypatch.setattr(probe, "filesystem_socket_stat", swapped)
+
+    def advance(delay):
+        assert failure in {"deadline", "restart", "start-time", "exit"}, (
+            "hard error retried"
+        )
+        now[0] += delay
+        if failure == "restart":
+            values["InvocationID"] = "b" * 32
+        elif failure == "start-time":
+            (probe.proc_root / "123/stat").write_bytes(
+                b"123 (python) " + b"0 " * 19 + b"9999\n"
+            )
+        elif failure == "exit":
+            values.update(ActiveState="failed", SubState="dead", MainPID="0")
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    monkeypatch.setattr(
+        operator_module.syslog, "syslog", lambda _p, text: logs.append(text)
+    )
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if failure in {"deadline", "exit"}
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    assert [
+        json.loads(s.split(" ", 1)[1])["phase"]
+        for s in logs
+        if s.startswith("helixweave-operator-phase ")
+        and json.loads(s.split(" ", 1)[1])["status"] != "begin"
+    ] == [
+        "start-preflight-observe",
+        "systemctl-start",
+        "strong-observe",
+    ]
+    if failure == "deadline":
+        assert now[0] == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize(
+    "unit", ("helixweave-redis.service", "helixweave-docker-rootless.service")
+)
+def test_proc_scan_pending_is_not_a_status_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit: str
+) -> None:
+    probe, _ = _unix_socket_probe(tmp_path)
+
+    def missing(_path):
+        raise FileNotFoundError(errno.ENOENT, "gone")
+
+    monkeypatch.setattr(os, "scandir", missing)
+    with pytest.raises(DeploymentError) as caught:
+        probe._socket_witnesses(
+            unit=unit, cgroup="/system.slice/helixweave-redis.service", main_pid=123
+        )
+    assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+
+
+def _worker_start_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    controller, probe, _request, values = _api_start_probe(tmp_path, monkeypatch)
+    unit = "helixweave-worker.service"
+    group = probe.cgroup_root / "system.slice" / unit
+    group.mkdir()
+    (group / "cgroup.procs").write_text("123\n")
+    process = probe.proc_root / "123"
+    (process / "status").write_text("Uid:\t123 123 123 123\nGid:\t456 456 456 456\n")
+    monkeypatch.setattr(
+        operator_module.pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=123, pw_gid=456),
+    )
+    values["ControlGroup"] = f"/system.slice/{unit}"
+    forms = tuple(
+        (command, (process / "exe").stat())
+        for command in (
+            b"verified-dispatcher\0",
+            b"verified-candidate-launcher\0",
+            b"verified-final\0",
+        )
+    )
+    (process / "cmdline").write_bytes(forms[0][0])
+    monkeypatch.setattr(
+        probe,
+        "_worker_launch_forms",
+        lambda identity: forms if identity == IDENTITY else (),
+    )
+
+    def start(action, name):
+        assert (action, name) == ("start", unit)
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+
+    probe.systemctl.control = start
+    request = OperatorRequest(
+        operation="start",
+        unit=unit,
+        deployment_identity=IDENTITY,
+        task_identity=TASK_IDENTITY,
+    )
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    return controller, probe, request, values, forms, now
+
+
+@pytest.mark.parametrize("command", ("api", "worker"))
+def test_service_argv_is_derived_from_bound_release_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    relative = "payload/platform/bin/helixweave-service"
+    content = (TEMPLATES / "helixweave-service").read_bytes()
+    manifest, payload = manifest_for("platform", extra_payload={relative: content})
+    manifest = type(manifest).create(
+        component=manifest.component,
+        contracts=manifest.contracts,
+        files=tuple(
+            replace(f, mode=0o555) if f.path == relative else f for f in manifest.files
+        ),
+    )
+    bundle = tmp_path / "platform.tar"
+    write_bundle(bundle, manifest, payload)
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    BundleStore(layout).stage(bundle)
+    probe = LinuxServiceProbe(
+        SimpleNamespace(), layout=layout, owner_uid=os.getuid(), owner_gid=os.getgid()
+    )
+    monkeypatch.setattr(
+        operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
+    )
+    forms = probe._candidate_launch_forms(manifest.identity, command)
+    if command == "worker":
+        assert forms == probe._worker_launch_forms(manifest.identity)
+    release = layout.platform_releases / manifest.identity
+    main = runpy.run_path(str(TEMPLATES / "helixweave-service"))["main"]
+    calls = []
+    monkeypatch.setitem(
+        main.__globals__,
+        "_fixed_release",
+        lambda: (release, release / "payload/platform/lib/python3.12/site-packages"),
+    )
+    monkeypatch.setattr(
+        os, "execve", lambda executable, argv, env: calls.append((executable, argv))
+    )
+    assert main((command,)) == 70  # execve was recorded, not executed.
+    assert forms[2][0] == b"\0".join(a.encode() for a in calls[0][1]) + b"\0"
+    assert str(release).encode() in forms[1][0] and str(release).encode() in forms[2][0]
+    logs = []
+    monkeypatch.setattr(operator_module.syslog, "syslog", lambda _p, s: logs.append(s))
+    # The forms used for diagnostics come from these verified candidate bytes,
+    # not from the observed command. Unknown/other-candidate argv stays unknown.
+    for before, after, names in (
+        (forms[0][0], forms[1][0], ("dispatcher", "platform-launcher")),
+        (forms[1][0], forms[2][0], ("platform-launcher", "final-entry")),
+        (forms[2][0], b"private-token/unknown\0", ("final-entry", "unknown")),
+    ):
+        probe._stability_diagnostic(
+            unit=f"helixweave-{command}.service",
+            deployment_identity=manifest.identity,
+            task_identity=TASK_IDENTITY,
+            values={},
+            final_values={},
+            closing=12,
+            final_closing=12,
+            start_ticks=1,
+            final_start_ticks=1,
+            executable=forms[0][1],
+            final_executable=forms[0][1],
+            cmdline=before,
+            final_cmdline=after,
+        )
+        record = json.loads(logs[-1].split(" ", 1)[1])
+        assert record["launcher_forms"] == dict(zip(("before", "after"), names))
+        assert record["changed_fields"] == ["cmdline"]
+    assert str(release) not in "".join(logs)
+    assert "private-token" not in "".join(logs)
+    binary = release / relative
+    binary.chmod(0o755)
+    binary.write_bytes(content + b"# drift\n")
+    binary.chmod(0o555)
+    with pytest.raises(OSError):
+        probe._candidate_launch_forms(manifest.identity, command)
+
+
+@pytest.mark.parametrize(
+    ("command_name", "method", "exec_during_observation", "skip_launcher"),
+    (
+        ("worker", "start", False, False),
+        ("worker", "start", True, False),
+        ("worker", "recover_observe", False, False),
+        ("api", "start", True, False),
+        ("api", "start", False, True),
+        ("api", "recover_start", True, False),
+        ("api", "recover_observe", True, False),
+    ),
+)
+def test_service_start_only_persists_final_verified_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command_name: str,
+    method: str,
+    exec_during_observation: bool,
+    skip_launcher: bool,
+) -> None:
+    if command_name == "worker":
+        controller, probe, request, values, forms, now = _worker_start_probe(
+            tmp_path, monkeypatch
+        )
+    else:
+        controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+        forms = probe._candidate_launch_forms(IDENTITY, "api")
+        (probe.proc_root / "123/cmdline").write_bytes(forms[0][0])
+        now = [0.0]
+        monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+        if skip_launcher:
+            (probe.proc_root / "net/tcp").write_text(
+                "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+            )
+    if method == "recover_observe":
+        values.update(ActiveState="active", SubState="running", MainPID="123")
+    persisted = []
+    monkeypatch.setattr(controller, "_write_identity", persisted.append)
+    command = probe.proc_root / "123/cmdline"
+    if exec_during_observation:
+        original = probe._socket_witnesses
+
+        def exec_to_launcher(**kwargs):
+            try:
+                return original(**kwargs)
+            finally:
+                if command.read_bytes() == forms[0][0]:
+                    command.write_bytes(forms[1][0])
+
+        monkeypatch.setattr(probe, "_socket_witnesses", exec_to_launcher)
+
+    def advance(delay):
+        assert not persisted
+        now[0] += delay
+        stage = next(
+            i for i, form in enumerate(forms) if form[0] == command.read_bytes()
+        )
+        command.write_bytes(forms[2 if skip_launcher else min(stage + 1, 2)][0])
+        if command_name == "api" and stage == 2:
+            # Reaching final argv alone is not readiness: the listener appears
+            # only after another complete observation of the final process.
+            (probe.proc_root / "net/tcp").write_text(
+                "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+            )
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    observed = getattr(controller, method)(request)
+    assert persisted == [observed]
+    assert (
+        observed.cmdline_identity == "sha256-" + hashlib.sha256(forms[2][0]).hexdigest()
+    )
+    assert observed.main_pid == 123 and observed.process_start_ticks == 5678
+    if command_name == "api":
+        assert observed.sockets == (SocketWitness("api-http", 41, 4567, 4567),)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("unknown", "regress-during-observe", "regress-between-observes", "stuck"),
+)
+def test_api_entry_transition_is_not_arbitrary_process_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    controller, probe, request, _values = _api_start_probe(tmp_path, monkeypatch)
+    forms = probe._candidate_launch_forms(IDENTITY, "api")
+    command = probe.proc_root / "123/cmdline"
+    command.write_bytes(b"foreign-candidate\0" if failure == "unknown" else forms[1][0])
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    if failure == "regress-during-observe":
+
+        def regress(**_kwargs):
+            command.write_bytes(forms[0][0])
+            raise operator_module._ServiceReadinessPending()
+
+        monkeypatch.setattr(probe, "_socket_witnesses", regress)
+
+    def advance(delay):
+        assert failure in {"regress-between-observes", "stuck"}, "hard mismatch retried"
+        now[0] += delay
+        if failure == "regress-between-observes":
+            assert now[0] == 0.1, "regression retried"
+            command.write_bytes(forms[0][0])
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if failure == "stuck"
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    if failure == "stuck":
+        assert now[0] == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("wrong-candidate", "unknown", "exec-unknown", "restart", "exit", "stuck"),
+)
+def test_worker_start_fails_closed_without_persisting_transient_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    controller, probe, request, values, _forms, now = _worker_start_probe(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    command = probe.proc_root / "123/cmdline"
+    if failure == "wrong-candidate":
+        request = replace(request, deployment_identity=OLD_PLATFORM_IDENTITY)
+    elif failure == "unknown":
+        command.write_bytes(b"foreign-command\0")
+    elif failure == "exec-unknown":
+        original = probe._socket_witnesses
+
+        def unknown_exec(**kwargs):
+            result = original(**kwargs)
+            command.write_bytes(b"foreign-command\0")
+            return result
+
+        monkeypatch.setattr(probe, "_socket_witnesses", unknown_exec)
+
+    def advance(delay):
+        assert failure in {"stuck", "restart", "exit"}, "hard mismatch retried"
+        now[0] += delay
+        if failure == "restart":
+            values["InvocationID"] = "b" * 32
+        elif failure == "exit":
+            values.update(ActiveState="failed", SubState="dead", MainPID="0")
+
+    monkeypatch.setattr(operator_module.time, "sleep", advance)
+    with pytest.raises(DeploymentError) as caught:
+        controller.start(request)
+    assert caught.value.issue.code == (
+        "OPERATOR_SERVICE_START_FAILED"
+        if failure in {"stuck", "exit"}
+        else "OPERATOR_SERVICE_OBSERVE_FAILED"
+    )
+    if failure == "stuck":
+        assert now[0] == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize(
+    "failure", ("exit", "restart", "restart-ready", "late-success")
+)
+def test_api_readiness_does_not_adopt_a_restart_exit_or_late_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    controller, probe, request, values = _api_start_probe(tmp_path, monkeypatch)
+    now = [0.0]
+    monkeypatch.setattr(operator_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+
+    def change(delay):
+        now[0] += delay
+        if failure == "exit":
+            values.update(ActiveState="failed", SubState="dead", MainPID="0")
+        elif failure == "restart":
+            values["InvocationID"] = "b" * 32
+        else:
+            if failure == "restart-ready":
+                values["InvocationID"] = "b" * 32
+            (probe.proc_root / "net/tcp").write_text(
+                "header\n0: 0100007F:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+            )
+            original = probe._cgroup_socket_stat
+
+            def slow(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if failure == "late-success":
+                    now[0] = 15.0
+                return result
+
+            monkeypatch.setattr(probe, "_cgroup_socket_stat", slow)
+
+    monkeypatch.setattr(operator_module.time, "sleep", change)
+    with pytest.raises(DeploymentError) as captured:
+        controller.start(request)
+    assert captured.value.issue.code == (
+        "OPERATOR_SERVICE_OBSERVE_FAILED"
+        if failure in {"restart", "restart-ready"}
+        else "OPERATOR_SERVICE_START_FAILED"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure", ("wrong-listener", "foreign-owner", "cgroup", "unstable-process")
+)
+def test_api_missing_listener_does_not_mask_hard_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    controller, probe, request, _ = _api_start_probe(tmp_path, monkeypatch)
+    if failure in {"wrong-listener", "foreign-owner"}:
+        endpoint = "00000000" if failure == "wrong-listener" else "0100007F"
+        (probe.proc_root / "net/tcp").write_text(
+            f"header\n0: {endpoint}:1F40 00000000:0000 0A 0 0 0 997 0 4567\n"
+        )
+        monkeypatch.setattr(probe, "_cgroup_socket_stat", lambda *_a, **_k: None)
+    elif failure == "cgroup":
+        (probe.cgroup_root / "system.slice" / request.unit / "cgroup.procs").write_text(
+            "999\n"
+        )
+    else:
+        original = probe._socket_witnesses
+
+        def change_process(**kwargs):
+            try:
+                return original(**kwargs)
+            finally:
+                (probe.proc_root / "123/cmdline").write_bytes(b"wrong-command\x00")
+
+        monkeypatch.setattr(probe, "_socket_witnesses", change_process)
+    monkeypatch.setattr(
+        operator_module.time, "sleep", lambda _d: pytest.fail("retried")
+    )
+    monkeypatch.setattr(
+        controller, "_write_identity", lambda _s: pytest.fail("persisted")
+    )
+    with pytest.raises(DeploymentError) as captured:
+        controller.start(request)
+    assert captured.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
+
+
+@pytest.mark.parametrize("pending_boundary", ("socket", "listener"))
+def test_linux_service_start_probe_only_retries_absent_socket_or_listener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_boundary: str,
+) -> None:
+    probe, _socket_path = _unix_socket_probe(tmp_path)
+    if pending_boundary == "socket":
+
+        def missing_socket(_path: Path) -> os.stat_result:
+            raise FileNotFoundError
+
+        monkeypatch.setattr(probe, "filesystem_socket_stat", missing_socket)
+    else:
+        (probe.proc_root / "net/unix").write_text(
+            "Num RefCount Protocol Flags Type St Inode Path\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(operator_module._ServiceReadinessPending):
+        probe._socket_witnesses(
+            unit="helixweave-redis.service",
+            cgroup="/system.slice/helixweave-redis.service",
+            main_pid=123,
+            allow_socket_pending=True,
+        )
+
+
 def test_linux_service_probe_rejects_kernel_socket_owned_by_another_cgroup(
     tmp_path: Path,
 ) -> None:
@@ -1245,6 +2796,7 @@ def test_linux_service_probe_rejects_kernel_socket_owned_by_another_cgroup(
             unit="helixweave-redis.service",
             cgroup="/system.slice/helixweave-redis.service",
             main_pid=123,
+            allow_socket_pending=True,
         )
 
     assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
@@ -1259,6 +2811,7 @@ def test_linux_service_probe_rejects_stale_non_listening_proc_socket(
             unit="helixweave-redis.service",
             cgroup="/system.slice/helixweave-redis.service",
             main_pid=123,
+            allow_socket_pending=True,
         )
 
     assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
@@ -1293,6 +2846,7 @@ def test_linux_service_probe_rejects_filesystem_socket_swap(
             unit="helixweave-redis.service",
             cgroup="/system.slice/helixweave-redis.service",
             main_pid=123,
+            allow_socket_pending=True,
         )
 
     assert caught.value.issue.code == "OPERATOR_SERVICE_OBSERVE_FAILED"
@@ -1870,6 +3424,179 @@ def test_database_prepare_dispatcher_loads_in_isolated_stdlib_python() -> None:
     assert completed.stderr == b""
 
 
+_CANONICAL_LAUNCHERS = (
+    "helixweave-operator-action",
+    "helixweave-encode-runtime-prepare",
+)
+
+
+def _canonical_launcher_documents(
+    launcher: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if launcher == "helixweave-operator-action":
+        request = DeploymentActionRequest.create(
+            phase="admit",
+            operation="activate",
+            component="platform",
+            task_identity=TASK_IDENTITY,
+            deployment_identity=IDENTITY,
+            authority_platform_identity=IDENTITY,
+            prior_state_identity=SERVICE_IDENTITY,
+            candidate_state_identity=THIRD_IDENTITY,
+            candidate_active={
+                "platform": IDENTITY,
+                "encode-runtime": SERVICE_IDENTITY,
+                "bulk-rnaseq-runtime": THIRD_IDENTITY,
+            },
+        )
+        receipt = DeploymentActionReceipt.create(
+            request_identity=request.identity,
+            status="admitted",
+            compatibility="compatible",
+            database_before_identity=IDENTITY,
+            accepted_schema_heads=("head",),
+            target_schema_heads=("head",),
+            migration_inventory_identity=SERVICE_IDENTITY,
+            known_schema_revisions=("ancestor",),
+            migration_required=False,
+            rollback_supported=True,
+            api_contract_sha256="a" * 64,
+            native_identities={
+                "platform": IDENTITY,
+                "encode-runtime": SERVICE_IDENTITY,
+                "bulk-rnaseq-runtime": THIRD_IDENTITY,
+            },
+            frontend_identity=IDENTITY,
+            reference_compatibility_identity=SERVICE_IDENTITY,
+            readiness={
+                check: ReadinessCheck("ready", "READY", IDENTITY)
+                for check in VERIFICATION_CHECKS
+            },
+        )
+        return request.to_dict(), receipt.to_dict()
+    if launcher == "helixweave-encode-runtime-prepare":
+        request = EncodeRuntimePrepareRequest.create(
+            task_identity=TASK_IDENTITY,
+            deployment_identity=IDENTITY,
+            authority_platform_identity=SERVICE_IDENTITY,
+            prior_state_identity=IDENTITY,
+            candidate_state_identity=SERVICE_IDENTITY,
+        )
+        receipt = EncodeRuntimePrepareReceipt.create(
+            request_identity=request.identity,
+            deployment_identity=IDENTITY,
+            inventory=_encode_runtime_inventory(),
+        )
+        return request.to_dict(), receipt.to_dict()
+    raise AssertionError(launcher)
+
+
+def _document_encoding(value: dict[str, object], encoding: str) -> bytes:
+    canonical = canonical_json_bytes(value)
+    if encoding == "canonical":
+        return canonical
+    if encoding == "missing-newline":
+        return canonical[:-1]
+    if encoding == "extra-newline":
+        return canonical + b"\n"
+    if encoding == "pretty":
+        return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    raise AssertionError(encoding)
+
+
+@pytest.mark.parametrize("launcher", _CANONICAL_LAUNCHERS)
+@pytest.mark.parametrize(
+    "encoding", ("canonical", "missing-newline", "extra-newline", "pretty")
+)
+def test_candidate_launcher_validates_canonical_request_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launcher: str,
+    encoding: str,
+) -> None:
+    request, _receipt = _canonical_launcher_documents(launcher)
+    path = tmp_path / "request.json"
+    path.write_bytes(_document_encoding(request, encoding))
+    path.chmod(0o640)
+    namespace = runpy.run_path(str(TEMPLATES / launcher))
+    read_request = namespace["_request"]
+    read_request.__globals__["REQUEST"] = path
+    original_fstat = os.fstat
+
+    def root_owned_fstat(descriptor: int):
+        observed = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_mode=observed.st_mode,
+            st_nlink=observed.st_nlink,
+            st_uid=0,
+            st_gid=os.getegid(),
+            st_size=observed.st_size,
+            st_dev=observed.st_dev,
+            st_ino=observed.st_ino,
+            st_mtime_ns=observed.st_mtime_ns,
+            st_ctime_ns=observed.st_ctime_ns,
+        )
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(read_request.__globals__["os"], "fstat", root_owned_fstat)
+        if encoding == "canonical":
+            assert read_request() == request
+        else:
+            with pytest.raises(ValueError):
+                read_request()
+
+
+@pytest.mark.parametrize("launcher", _CANONICAL_LAUNCHERS)
+@pytest.mark.parametrize(
+    ("encoding", "expected_exit"),
+    (
+        ("canonical", 0),
+        ("missing-newline", 65),
+        ("extra-newline", 65),
+        ("pretty", 65),
+    ),
+)
+def test_candidate_launcher_validates_canonical_child_receipt_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    launcher: str,
+    encoding: str,
+    expected_exit: int,
+) -> None:
+    request, receipt = _canonical_launcher_documents(launcher)
+    content = _document_encoding(receipt, encoding)
+    namespace = runpy.run_path(str(TEMPLATES / launcher))
+    main = namespace["main"]
+    written: list[bytes] = []
+
+    def run(_argv, *, stdout, **_kwargs):
+        stdout.write(content)
+        return SimpleNamespace(returncode=0)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(main.__globals__["os"], "environ", {})
+        scoped.setattr(main.__globals__["subprocess"], "run", run)
+        scoped.setitem(main.__globals__, "_request", lambda: request)
+        scoped.setitem(main.__globals__, "_launcher", lambda _identity: Path("/fixed"))
+        scoped.setitem(main.__globals__, "_write_receipt", written.append)
+        observed_exit = main([])
+
+    assert observed_exit == expected_exit
+    assert written == ([content] if expected_exit == 0 else [])
+
+
+@pytest.mark.parametrize("launcher", _CANONICAL_LAUNCHERS)
+def test_candidate_launcher_canonical_renderer_matches_authority(
+    launcher: str,
+) -> None:
+    namespace = runpy.run_path(str(TEMPLATES / launcher))
+    render = namespace["_canonical_json_bytes"]
+    value = {"unicode": "核", "nested": {"b": 2, "a": 1}}
+
+    assert render(value) == canonical_json_bytes(value)
+    with pytest.raises(ValueError):
+        render({"invalid": float("nan")})
+
+
 @dataclass
 class _FreshActionRunner:
     target_schema: str = "schema-v1"
@@ -2060,6 +3787,10 @@ class _FreshServices:
         assert self.running is not None
         return self.running.get(request.unit)
 
+    def prepare_redis_transfer(self, **kwargs):
+        assert not self.running or "helixweave-redis.service" not in self.running
+        return None
+
     def stop(self, request, *, cleanup):
         assert self.running is not None
         assert not cleanup
@@ -2082,6 +3813,10 @@ class _TrackingServices:
     calls: list[tuple[str, str, str]]
     fail_start_once: str | None = None
     start_failed: bool = False
+
+    def prepare_redis_transfer(self, **kwargs):
+        assert "helixweave-redis.service" not in self.running
+        return None
 
     @staticmethod
     def _identity(request: OperatorRequest):
@@ -2138,6 +3873,553 @@ class _TrackingServices:
         service = self._identity(request)
         self.running[request.unit] = service
         return service
+
+
+class _RetainedRedisServices(SystemdServiceController):
+    """Real status/atomic identity writer; task-only process and queue fixture."""
+
+    unit = "helixweave-redis.service"
+
+    def __init__(self, layout):
+        self.live = True
+        self.redis_starts = 0
+        self.original_absent = True
+        self.writers = _TrackingServices({}, [])
+        self.queue = [b"task-only-queued-job", b"task-only-scheduled-job"]
+        self.physical = ServiceIdentity.create(
+            **{
+                **{
+                    key: value
+                    for key, value in _worker_service_identity().to_dict().items()
+                    if key != "identity"
+                },
+                "unit": self.unit,
+                "deployment_identity": OLD_PLATFORM_IDENTITY,
+                "sockets": (SocketWitness("redis-queue", 21, 22, 23),),
+            }
+        )
+        super().__init__(
+            layout,
+            probe=self,
+            systemctl=self,
+            owner_uid=os.getuid(),
+            owner_gid=os.getgid(),
+        )
+        layout.service_identities.mkdir(parents=True, mode=0o700)
+        self._write_identity(self.physical)
+        self.writes = 0
+        self.incompatible = None
+        for unit in WRITER_UNITS:
+            request = OperatorRequest(
+                operation="start",
+                unit=unit,
+                deployment_identity=OLD_PLATFORM_IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+            self.writers.running[unit] = self.writers._identity(request)
+
+    def observe(self, *, unit, deployment_identity, task_identity):
+        if unit in WRITER_UNITS:
+            return self.writers.running.get(unit)
+        assert unit == self.unit
+        if not self.live:
+            return None
+        value = self._redis_bound_to(self.physical, deployment_identity)
+        assert value.task_identity == task_identity
+        return value
+
+    def control(self, action, unit):
+        assert action == "start" and unit == self.unit and not self.live
+        assert not self.queue  # Explicit tests acknowledge already lost volatile data.
+        self.redis_starts += 1
+        raw = self.physical.to_dict()
+        del raw["identity"]
+        raw.update(
+            main_pid=raw["main_pid"] + 1,
+            process_start_ticks=raw["process_start_ticks"] + 1,
+            invocation_identity="sha256-" + "9" * 64,
+            deployment_identity=self.start_request.deployment_identity,
+            task_identity=self.start_request.task_identity,
+            sockets=self.physical.sockets,
+        )
+        self.physical = ServiceIdentity.create(**raw)
+        self.live = True
+
+    def require_process_absent(self, service):
+        assert service.main_pid == self.physical.main_pid
+        if not self.original_absent:
+            raise fail("OPERATOR_SERVICE_IDENTITY_MISMATCH", "Original process exists.")
+
+    def _redis_requirements(self, deployment):
+        return (
+            ("different" if deployment == self.incompatible else "same", 10, 0o444),
+        )
+
+    def _write_identity(self, service):
+        super()._write_identity(service)
+        if hasattr(self, "writes"):
+            self.writes += 1
+
+    def status(self, request):
+        if request.unit == self.unit:
+            return super().status(request)
+        return self.writers.status(request)
+
+    def start(self, request):
+        if request.unit == self.unit:
+            self.start_request = request
+            return super().start(request)
+        return self.writers.start(request)
+
+    def stop(self, request, *, cleanup):
+        assert request.unit != self.unit
+        return self.writers.stop(request, cleanup=cleanup)
+
+
+@pytest.mark.parametrize("drift", (None, "redis.conf", "helixweave-redis.service"))
+def test_retained_redis_requires_manifest_bound_installed_configuration(
+    tmp_path, monkeypatch, drift
+):
+    prefix = "payload/platform/lib/python3.12/site-packages/encode_pipeline/deployment/templates/"
+    files = {}
+    targets = {}
+    for installed in (
+        Path("/etc/helixweave/redis.conf"),
+        Path("/usr/lib/systemd/system/helixweave-redis.service"),
+    ):
+        target = tmp_path / installed.name
+        content = (TEMPLATES / installed.name).read_bytes()
+        target.write_bytes(content)
+        target.chmod(0o444)
+        targets[installed] = target
+        files[prefix + installed.name] = (
+            content if drift != installed.name else content + b"# incompatible\n"
+        )
+    manifest, _ = manifest_for("platform", extra_payload=files)
+    monkeypatch.setattr(
+        BundleStore, "read_installed_manifest", lambda *a, **kw: manifest
+    )
+    monkeypatch.setattr(
+        operator_module, "verify_stable_operator_boundary", lambda: IDENTITY
+    )
+    monkeypatch.setattr(operator_module, "UNINSTALL_LINKED_BOUNDARY_TARGETS", targets)
+    lstat = Path.lstat
+    readlink = os.readlink
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda p: (
+            SimpleNamespace(
+                st_mode=stat.S_IFLNK | 0o777,
+                st_uid=os.getuid(),
+                st_gid=os.getgid(),
+                st_nlink=1,
+            )
+            if p in targets
+            else lstat(p)
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "readlink",
+        lambda p, **kw: str(targets[p]) if p in targets else readlink(p, **kw),
+    )
+    services = SystemdServiceController(
+        DeploymentLayout.isolated(tmp_path / "host"),
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    if drift:
+        with pytest.raises(DeploymentError, match="DEPLOYMENT_COMPATIBILITY_FAILED"):
+            services._redis_requirements(manifest.identity)
+    else:
+        signature = services._redis_requirements(manifest.identity)
+        assert len(signature) == 2
+        assert all(mode == 0o444 for _, _, mode in signature)
+
+
+def _redis_platform_transaction_fixture(tmp_path):
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    states, prior = _state_with_active_components(
+        layout,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+        staged_component="platform",
+        staged_identity=IDENTITY,
+    )
+    _write_operator_test_database(layout, heads=("schema-v1",), value="preserved")
+    services = _RetainedRedisServices(layout)
+    controller = HostDeploymentActionController(
+        layout,
+        states=states,
+        services=services,
+        action_runner=_FreshActionRunner(target_schema="schema-v1"),
+        database_preparer=_FreshDatabasePreparer(layout, os.getuid(), os.getgid()),
+        encode_runtime_preparer=_FreshRuntimePreparer(),
+        configuration=_FreshConfiguration([], layout),
+        root_uid=os.getuid(),
+        root_gid=os.getgid(),
+        service_uid=os.getuid(),
+        service_gid=os.getgid(),
+    )
+    journals = OperatorJournalStore(
+        layout,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+        recovery_controller=controller,
+    )
+    return layout, states, prior, services, controller, journals
+
+
+def _run_platform_transaction(
+    controller, journals, *, operation="activate", identity=IDENTITY, task=TASK_IDENTITY
+):
+    with journals.operation(
+        operation=operation,
+        task_identity=task,
+        deployment_identity=identity,
+        component="platform",
+        unit=None,
+    ) as journal:
+        controller.execute(
+            OperatorRequest(
+                operation=operation,
+                component="platform",
+                deployment_identity=identity,
+                task_identity=task,
+            ),
+            journal=journal,
+        )
+        journal.complete()
+
+
+def _assert_redis_status(services, identity):
+    observed = services.status(
+        OperatorRequest(
+            operation="status",
+            unit=services.unit,
+            deployment_identity=identity,
+            task_identity=TASK_IDENTITY,
+        )
+    )
+    assert observed == services._redis_bound_to(services.physical, identity)
+    assert services.queue == [b"task-only-queued-job", b"task-only-scheduled-job"]
+    return observed
+
+
+def test_platform_upgrade_rollback_and_status_preserve_retained_redis(tmp_path):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    before = services.physical.to_dict()
+    _run_platform_transaction(controller, journals)
+    upgraded = _assert_redis_status(services, IDENTITY)
+    assert upgraded.task_identity == services.physical.task_identity
+    assert services.writes == 1
+    _run_platform_transaction(
+        controller,
+        journals,
+        operation="rollback",
+        identity=OLD_PLATFORM_IDENTITY,
+        task="task-" + "4" * 32,
+    )
+    _assert_redis_status(services, OLD_PLATFORM_IDENTITY)
+    assert services.writes == 2
+    assert services.physical.to_dict() == before
+    assert _database_value(layout) == "preserved"
+    for unit in WRITER_UNITS:
+        assert (
+            services.writers.running[unit].deployment_identity == OLD_PLATFORM_IDENTITY
+        )
+    assert (
+        states.read().components["bulk-rnaseq-runtime"]
+        == prior.components["bulk-rnaseq-runtime"]
+    )
+    assert (
+        states.read().components["encode-runtime"] == prior.components["encode-runtime"]
+    )
+
+
+def test_new_platform_transaction_repairs_completed_legacy_redis_binding(tmp_path):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    _run_platform_transaction(controller, journals)
+    history = layout.operator_transaction_history / f"{TASK_IDENTITY}.json"
+    completed_bytes = history.read_bytes()
+    # Reproduce the old implementation's saved identity after completed upgrade.
+    services._write_identity(services.physical)
+    before = services._identity_path(services.unit).read_bytes()
+    with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+        _assert_redis_status(services, IDENTITY)
+    assert services._identity_path(services.unit).read_bytes() == before
+    with states.transaction(
+        exclusive=True, expected_owner_uid=os.getuid(), expected_owner_gid=os.getgid()
+    ) as transaction:
+        current = transaction.read()
+        transaction.commit(
+            current.stage("platform", THIRD_IDENTITY),
+            operation="stage-platform",
+            expected_current_identity=current.identity,
+        )
+    _run_platform_transaction(
+        controller, journals, identity=THIRD_IDENTITY, task="task-" + "5" * 32
+    )
+    _assert_redis_status(services, THIRD_IDENTITY)
+    assert history.read_bytes() == completed_bytes
+    assert json.loads(completed_bytes)["phase"] == "complete"
+
+
+@pytest.mark.parametrize("mismatch", ("process", "configuration", "unknown-binding"))
+def test_retained_redis_transfer_rejects_untrusted_process_or_configuration(
+    tmp_path, mismatch
+):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    before = services._identity_path(services.unit).read_bytes()
+    if mismatch == "process":
+        raw = services.physical.to_dict()
+        del raw["identity"]
+        raw.update(main_pid=9999, sockets=services.physical.sockets)
+        services.physical = ServiceIdentity.create(**raw)
+    elif mismatch == "configuration":
+        services.incompatible = IDENTITY
+    else:
+        services._write_identity(
+            services._redis_bound_to(services.physical, THIRD_IDENTITY)
+        )
+        before = services._identity_path(services.unit).read_bytes()
+    with pytest.raises(DeploymentError):
+        _run_platform_transaction(controller, journals)
+    assert states.read().identity == prior.identity
+    assert services._identity_path(services.unit).read_bytes() == before
+    assert services.queue == [b"task-only-queued-job", b"task-only-scheduled-job"]
+    assert not any(call[0] in {"start", "stop"} for call in services.writers.calls)
+
+
+@pytest.mark.parametrize(
+    "interrupt", ("state-committed", "binding-written", "post-ponr")
+)
+def test_retained_redis_binding_interruption_recovers_idempotently(
+    tmp_path, monkeypatch, interrupt
+):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    # Leave the journal in recovery-required, as an interrupted operator would.
+    journals.recovery_controller = None
+    with monkeypatch.context() as patch:
+        if interrupt == "post-ponr":
+            services.writers.fail_start_once = "helixweave-api.service"
+        else:
+            original = services._write_identity
+
+            def interrupted_write(service):
+                if interrupt == "binding-written":
+                    original(service)
+                raise fail("TEST_BINDING_WRITE_INTERRUPTED", "Interrupted write.")
+
+            patch.setattr(services, "_write_identity", interrupted_write)
+        with pytest.raises(DeploymentError):
+            _run_platform_transaction(controller, journals)
+    record = journals._read(layout.operator_transaction_active)
+    assert record.evidence["retained_redis_identity"] == services.physical.identity
+    recovered = controller.recover(record)
+    assert controller.recover(record) == recovered
+    expected = IDENTITY if interrupt == "post-ponr" else OLD_PLATFORM_IDENTITY
+    _assert_redis_status(services, expected)
+    assert states.read().components["platform"].active == expected
+    assert _database_value(layout) == "preserved"
+    assert services.writes <= 2
+    if interrupt != "post-ponr":
+        # Recovery must not adopt an unknown saved slot while searching for the
+        # candidate/prior writer. The retained queue is still untouched.
+        services.writers.running[WRITER_UNITS[0]] = services.writers._identity(
+            OperatorRequest(
+                operation="start",
+                unit=WRITER_UNITS[0],
+                deployment_identity=THIRD_IDENTITY,
+                task_identity=TASK_IDENTITY,
+            )
+        )
+        with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+            controller._observe_recovery_service(record, WRITER_UNITS[0])
+        _assert_redis_status(services, expected)
+
+
+def _stopped_retained_recovery_fixture(tmp_path):
+    layout, states, prior, services, controller, journals = (
+        _redis_platform_transaction_fixture(tmp_path)
+    )
+    journals.recovery_controller = None
+    services.writers.fail_start_once = WRITER_UNITS[0]
+    with pytest.raises(DeploymentError):
+        _run_platform_transaction(controller, journals)
+    record = journals._read(layout.operator_transaction_active)
+    assert record.point_of_no_return and record.phase == "recovery-required"
+    services.live = False  # Model a previously stopped Redis, not a product restart.
+    services.queue.clear()
+    services.writers.running.clear()
+    backend = HostOperatorBackend(
+        layout=layout,
+        service_controller=services,
+        state_store=states,
+        deployment_controller=controller,
+        journal_store=journals,
+        root_uid=os.getuid(),
+        root_gid=os.getgid(),
+        operator_group_gid=os.getgid(),
+        service_uid=os.getuid(),
+        service_gid=os.getgid(),
+        api_uid=os.getuid() + 1,
+        api_gid=os.getgid() + 1,
+        candidate_uid=os.getuid() + 2,
+        candidate_gid=os.getgid() + 2,
+    )
+    request = OperatorRequest(
+        operation="start",
+        unit=services.unit,
+        deployment_identity=IDENTITY,
+        task_identity=record.task_identity,
+    )
+    return layout, states, services, controller, journals, backend, request, record
+
+
+@pytest.mark.parametrize(
+    "interrupt", (None, "before-result-checkpoint", "after-result-checkpoint")
+)
+def test_explicit_stopped_retained_redis_recovery_is_checkpointed_and_idempotent(
+    tmp_path, monkeypatch, interrupt
+):
+    layout, states, services, controller, journals, backend, request, record = (
+        _stopped_retained_recovery_fixture(tmp_path)
+    )
+    original_witness = record.evidence["retained_redis_identity"]
+    with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+        controller.recover(record)  # Ordinary reconciliation must not opt in.
+    assert services.redis_starts == 0
+    if interrupt:
+        replace_active = journals._replace_active
+
+        def interrupted(value, **kwargs):
+            if "retained_redis_replacement_identity" in value.evidence:
+                if interrupt == "after-result-checkpoint":
+                    replace_active(value, **kwargs)
+                raise OSError(errno.EIO, "private checkpoint failure")
+            return replace_active(value, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(journals, "_replace_active", interrupted)
+            with pytest.raises(OSError):
+                backend.execute(request, bundle_path=None)
+    result = backend.execute(request, bundle_path=None)
+    assert result.state == "running" and services.redis_starts == 1
+    assert backend.execute(request, bundle_path=None) == result
+    checkpoint = journals._read(layout.operator_transaction_active)
+    assert checkpoint.evidence["retained_redis_identity"] == original_witness
+    assert (
+        checkpoint.evidence["retained_redis_replacement_identity"]
+        == result.service.identity
+    )
+    assert checkpoint.failure_phase == record.failure_phase
+    assert checkpoint.task_identity == record.task_identity
+    assert checkpoint.deployment_identity == record.deployment_identity
+    assert checkpoint.phase == "recovery-required" and checkpoint.point_of_no_return
+    recovered = controller.recover(checkpoint)
+    assert recovered.phase == "complete"
+    assert controller.recover(checkpoint) == recovered
+    assert services.redis_starts == 1 and services.queue == []
+    assert _database_value(layout) == "preserved"
+    assert checkpoint.evidence.items() <= recovered.evidence.items()
+
+
+def test_explicit_recovery_keeps_a_surviving_retained_redis(tmp_path):
+    layout, states, services, controller, journals, backend, request, record = (
+        _stopped_retained_recovery_fixture(tmp_path)
+    )
+    services.live = True
+    services.queue = [b"task-only-retained-data"]
+    before = layout.operator_transaction_active.read_bytes()
+    result = backend.execute(request, bundle_path=None)
+    assert result.service.main_pid == services.physical.main_pid
+    assert services.redis_starts == 0
+    assert services.queue == [b"task-only-retained-data"]
+    assert layout.operator_transaction_active.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "unknown-process",
+        "configuration",
+        "original-still-present",
+        "wrong-task",
+        "wrong-candidate",
+    ),
+)
+def test_stopped_retained_redis_recovery_rejects_untrusted_replacements(
+    tmp_path, mismatch
+):
+    layout, states, services, controller, journals, backend, request, record = (
+        _stopped_retained_recovery_fixture(tmp_path)
+    )
+    before = layout.operator_transaction_active.read_bytes()
+    if mismatch == "unknown-process":
+        services.live = True
+        raw = services.physical.to_dict()
+        del raw["identity"]
+        raw.update(main_pid=9999, sockets=services.physical.sockets)
+        services.physical = ServiceIdentity.create(**raw)
+    elif mismatch == "configuration":
+        services.incompatible = IDENTITY
+    elif mismatch == "original-still-present":
+        services.original_absent = False
+    elif mismatch == "wrong-task":
+        request = replace(request, task_identity="task-" + "9" * 32)
+    else:
+        request = replace(request, deployment_identity=THIRD_IDENTITY)
+    with pytest.raises(DeploymentError):
+        backend.execute(request, bundle_path=None)
+    assert services.redis_starts == 0
+    assert layout.operator_transaction_active.read_bytes() == before
+
+
+@pytest.mark.parametrize("process", ("absent", "reused", "live", "denied"))
+def test_retained_process_absence_uses_boot_and_start_ticks(
+    tmp_path, monkeypatch, process
+):
+    service = _worker_service_identity()
+    proc = tmp_path / "proc"
+    boot = proc / "sys/kernel/random/boot_id"
+    boot.parent.mkdir(parents=True)
+    boot.write_bytes(b"test-boot\n")
+    service = replace(
+        service, boot_identity=operator_module._bytes_identity(b"test-boot")
+    )
+    target = proc / str(service.main_pid) / "stat"
+    if process != "absent":
+        target.parent.mkdir()
+        target.write_bytes(
+            b"1 (redis) S "
+            + b"0 " * 18
+            + str(service.process_start_ticks + (process == "reused")).encode()
+        )
+    if process == "denied":
+        read = Path.read_bytes
+
+        def denied(p):
+            if p == target:
+                raise PermissionError(errno.EACCES, "private")
+            return read(p)
+
+        monkeypatch.setattr(Path, "read_bytes", denied)
+    probe = LinuxServiceProbe(SimpleNamespace(), proc_root=proc)
+    if process in {"live", "denied"}:
+        with pytest.raises(DeploymentError, match="OPERATOR_SERVICE_IDENTITY_MISMATCH"):
+            probe.require_process_absent(service)
+    else:
+        probe.require_process_absent(service)
 
 
 def _supported_state_store(
@@ -2613,7 +4895,7 @@ def _write_operator_test_database(
     layout.run_root.chmod(0o755)
     layout.database.parent.mkdir(parents=True, exist_ok=True)
     layout.database.parent.chmod(0o2770)
-    with sqlite3.connect(layout.database) as connection:
+    with closing(sqlite3.connect(layout.database)) as connection, connection:
         connection.execute(
             "CREATE TABLE alembic_version (version_num VARCHAR(128) NOT NULL)"
         )
@@ -2627,7 +4909,9 @@ def _write_operator_test_database(
 
 
 def _database_value(layout: DeploymentLayout) -> str:
-    with sqlite3.connect(f"file:{layout.database}?mode=ro", uri=True) as connection:
+    with closing(
+        sqlite3.connect(f"file:{layout.database}?mode=ro", uri=True)
+    ) as connection:
         row = connection.execute("SELECT value FROM durable_state").fetchone()
     assert row is not None
     return str(row[0])
@@ -3634,9 +5918,97 @@ def test_incompatible_partial_assembly_is_rejected_without_side_effects(
     )
 
 
+@pytest.mark.parametrize(
+    "case", ["compatible", "wrong-schema", "changed-bytes", "unsafe-parent"]
+)
+def test_online_observation_uses_only_active_admitted_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    layout = DeploymentLayout.isolated(tmp_path / "host")
+    uid, gid = os.getuid(), os.getgid()
+    inventory = (
+        ROOT
+        / "src/encode_pipeline/persistence/migration-execution-inventory-1.0.0.json"
+    ).read_bytes()
+    target = tuple(json.loads(inventory)["heads"])
+    original, payload = manifest_for("platform")
+    binding = next(
+        c
+        for c in original.contracts
+        if c.contract == "helixweave.platform.database-migrations"
+    )
+    digest = hashlib.sha256(inventory).hexdigest()
+    payload[binding.path] = inventory
+    manifest = BundleManifest.create(
+        component="platform",
+        contracts=[
+            replace(c, identity=f"sha256-{digest}") if c == binding else c
+            for c in original.contracts
+        ],
+        files=[
+            replace(f, size_bytes=len(inventory), sha256=digest)
+            if f.path == binding.path
+            else f
+            for f in original.files
+        ],
+    )
+    store = BundleStore(layout)
+    store.stage(
+        write_bundle(tmp_path / "platform.tar", manifest, payload),
+        installed_owner_uid=uid,
+        installed_owner_gid=gid,
+    )
+    state = (
+        DeploymentState.initial()
+        .stage("platform", manifest.identity)
+        .activate("platform")
+    )
+    _write_operator_test_database(
+        layout, heads=target if case != "wrong-schema" else ("wrong",), value="retained"
+    )
+    provider = FixedObservationProvider(
+        layout,
+        _TrackingServices({}, []),
+        root_uid=uid,
+        root_gid=gid,
+        operator_group_gid=gid,
+        service_uid=uid,
+        service_gid=gid,
+    )
+    monkeypatch.setattr(provider, "_read_state", lambda _: state)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("status must not rehash all runtime bundles")
+
+    monkeypatch.setattr(BundleStore, "verify_installed", forbidden)
+    path = layout.component_store("platform") / manifest.identity / binding.path
+    if case == "changed-bytes":
+        path.chmod(0o644)
+        path.write_bytes(inventory.replace(target[0].encode(), b"wrong-schema"))
+        path.chmod(0o444)
+    elif case == "unsafe-parent":
+        path.parent.chmod(0o775)
+    observed = provider.observe(
+        OperatorRequest(
+            operation="observe",
+            deployment_identity=state.identity,
+            task_identity=TASK_IDENTITY,
+        )
+    )
+    assert observed.state_identity == state.identity
+    assert observed.active["platform"] == manifest.identity
+    assert (observed.database_schema_identity is not None) is (case == "compatible")
+    assert observed.database_schema_heads == (target if case == "compatible" else ())
+    assert _database_value(layout) == "retained"
+
+
+@pytest.mark.parametrize("online_head", ("schema-v1", "wrong-head"))
 def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    online_head: str,
 ) -> None:
     layout = DeploymentLayout.isolated(tmp_path / "host")
     owner_uid = os.getuid()
@@ -3674,22 +6046,57 @@ def test_root_verify_replaces_candidate_unavailable_database_and_configuration(
         service_gid=owner_gid,
     )
 
-    receipt = controller.verify(
-        OperatorRequest(
+    with closing(sqlite3.connect(layout.database)) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("UPDATE alembic_version SET version_num = ?", (online_head,))
+        writer.commit()
+        provider = FixedObservationProvider(
+            layout,
+            _TrackingServices({}, []),
+            root_uid=owner_uid,
+            root_gid=owner_gid,
+            operator_group_gid=owner_gid,
+            service_uid=owner_uid,
+            service_gid=owner_gid,
+        )
+        monkeypatch.setattr(provider, "_active_schema_target", lambda _: ("schema-v1",))
+        observation = provider.observe(
+            OperatorRequest(
+                operation="observe",
+                deployment_identity=state.identity,
+                task_identity=TASK_IDENTITY,
+            )
+        )
+        assert observation.database_schema_heads == (
+            (online_head,) if online_head == "schema-v1" else ()
+        )
+        request = OperatorRequest(
             operation="verify",
             deployment_identity=state.identity,
             task_identity=TASK_IDENTITY,
         )
-    )
+        if online_head != "schema-v1":
+            with pytest.raises(DeploymentError, match="DEPLOYMENT_SCHEMA_INCOMPATIBLE"):
+                controller.verify(request)
+            return
+        receipt = controller.verify(request)
+        assert observation.database_schema_identity == receipt.database_after_identity
+        with pytest.raises(DeploymentError, match="DATABASE_SIDECAR_NOT_QUIESCENT"):
+            inspect_database(
+                layout.database,
+                expected_owner_uid=owner_uid,
+                expected_owner_gid=owner_gid,
+            )
 
     assert receipt.status == "observed"
     assert receipt.compatibility == "compatible"
-    assert receipt.database_after_identity == database_content_identity(
-        inspect_database(
+    assert (
+        receipt.database_after_identity
+        == observe_online_database(
             layout.database,
             expected_owner_uid=owner_uid,
             expected_owner_gid=owner_gid,
-        )
+        ).identity
     )
     assert (
         receipt.accepted_schema_heads == receipt.target_schema_heads == ("schema-v1",)
@@ -3992,6 +6399,19 @@ def test_templates_encode_one_bounded_hybrid_topology() -> None:
     assert "Delegate=yes" in docker
     assert "unix:///run/helixweave/docker/docker.sock" in docker
     assert "--data-root=/var/lib/helixweave/docker-rootless" in docker
+    docker_exec_start = next(
+        line for line in docker.splitlines() if line.startswith("ExecStart=")
+    )
+    assert docker_exec_start == (
+        "ExecStart=/usr/bin/dockerd-rootless.sh "
+        "--host=unix:///run/helixweave/docker/docker.sock "
+        "--data-root=/var/lib/helixweave/docker-rootless "
+        "--exec-root=/run/helixweave/docker/exec "
+        "--pidfile=/run/helixweave/docker/docker.pid "
+        "--bridge=none --iptables=false --ip-forward=false --ip-masq=false "
+        "--group=0"
+    )
+    assert docker.count("--group=0") == 1
     assert "/var/run/docker.sock" not in docker
     assert (
         "Requires=helixweave-redis.service helixweave-docker-rootless.service" in target
@@ -4273,7 +6693,11 @@ def test_tmpfiles_separates_immutable_data_and_external_references() -> None:
     assert "/var/lib/helixweave/artifacts 2770 helixweave helixweave" in content
     assert "/operator/action 0750 root helixweave-candidate" in content
     assert "/operator/encode-runtime 0750 root helixweave-candidate" in content
-    assert "/operator/ingress/platform 2730 root helixweave-operators" in content
+    for component in ("platform", "encode-runtime", "bulk-rnaseq-runtime"):
+        assert (
+            f"/operator/ingress/{component} 2770 root helixweave-operators" in content
+        )
+    assert " 2730 root helixweave-operators" not in content
     assert "reference" not in content.lower()
 
     for unit_name in ("helixweave-api.service.in", "helixweave-worker.service.in"):
