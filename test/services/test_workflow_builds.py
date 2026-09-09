@@ -279,12 +279,13 @@ def test_build_identity_sanitizes_adapter_exception(tmp_path):
     assert secret not in str(result.issues[0].to_dict())
 
 
-def test_encode_runtime_build_digest_remains_byte_for_byte_compatible(tmp_path):
+def test_encode_runtime_build_digest_matches_release_golden(tmp_path):
     result = _capture(_project(tmp_path / "project"))
 
     assert result.is_success
+    # The adapter version is framed into this identity; this golden is for 0.4.1.
     assert result.value.digest == (
-        "7dbb24277494a040ae96db5abeeb32da88a46159b7fc587303515a7c44da5b38"
+        "d8c887a276cd33335845705b06ddf0edc5bd394b0c9068d3c5851121f5ff42a8"
     )
 
 

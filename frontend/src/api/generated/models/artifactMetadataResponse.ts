@@ -3,7 +3,7 @@
  * Do not edit manually.
  * HelixWeave API
  * Reproducible omics workflows, from inputs to evidence.
- * OpenAPI spec version: 0.4.0
+ * OpenAPI spec version: 0.4.1
  */
 import type { ArtifactMetadataResponseCatalogId } from './artifactMetadataResponseCatalogId';
 import type { ArtifactMetadataResponseScope } from './artifactMetadataResponseScope';

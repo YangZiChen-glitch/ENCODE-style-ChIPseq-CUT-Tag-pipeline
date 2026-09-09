@@ -170,7 +170,7 @@ print(json.dumps({
     assert completed.returncode == 0, completed.stderr
     receipt = json.loads(completed.stdout)
     assert receipt["identity"].startswith("sha256-")
-    assert receipt["version"] == "0.4.0"
+    assert receipt["version"] == "0.4.1"
     assert "index.html" in receipt["files"]
     assert all("node_modules" not in path for path in receipt["files"])
 

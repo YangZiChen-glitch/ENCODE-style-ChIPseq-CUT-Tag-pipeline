@@ -5,6 +5,11 @@ import path from 'node:path';
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Auto-detecting conditional requires races with module loading (notably Ajv).
+    // Preserve CommonJS initialization semantics independently of load order.
+    commonjsOptions: { strictRequires: true },
+  },
   server: {
     proxy: {
       '/api': process.env.VITE_API_PROXY_TARGET ?? 'http://127.0.0.1:8000',

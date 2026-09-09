@@ -5,6 +5,18 @@ environments. Temporary packages, wheelhouses, caches, bundles, databases, and
 host evidence stay outside Git. Passing the checklist makes a commit
 release-ready; tagging and publication always require a separate authorization.
 
+## v0.4.1 patch release
+
+For v0.4.1, use the generator, fresh-tag build, and dual clean-install commands
+below with `0.4.1` substituted in artifact names and version checks. The patch
+changes CommonJS frontend build determinism and synchronizes version metadata;
+it does not change dependency versions, scientific workflows, or database schema.
+Retain the v0.4.0 host/scientific evidence with its actual tested identities:
+do not repeat host acceptance or dispatch Protected Gate for this patch.
+Require ordinary, tag, and release CI for the new exact commits, and verify
+freshly built and re-downloaded wheel/sdist checksums before publication.
+Never replace the v0.4.0 tag/assets or reinterpret its failed release CI as passing.
+
 ## v0.4.0 identity and assets
 
 | Surface | Fixed identity |
