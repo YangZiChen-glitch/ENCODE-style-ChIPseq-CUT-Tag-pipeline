@@ -104,6 +104,33 @@ isolation, a non-local Docker endpoint, any skip/xfail, or an unclean exact
 checkout fails the job. OCI archives, JDKs, references, indexes, and biological
 data remain outside Git.
 
+The operator-owned Docker 29/containerd image-store daemon startup must use
+`umask 0022` for **both containerd and dockerd**, even when the surrounding
+evidence script uses `0077`. Containerd's overlay snapshot creation requests
+a `0755` root directory subject to that umask; a restrictive inherited umask
+can prevent the non-root task user from traversing the container root. Image
+digest/RootFS admission alone does not test that access. Keep evidence files
+owner-only; do not chmod image contents, run scientific tasks as root, or
+disable container security to compensate.
+
+Before launching a protected runner, set the test-harness-only environment
+variable `HELIXWEAVE_BULK_RNASEQ_PRIVATE_DIAGNOSTICS_DIR` to an absolute,
+canonical, runner-owned `0700` directory in that attempt's persistent evidence
+area, **outside `RUNNER_TEMP` and all artifact-upload globs**. Failed execution
+captures the earliest observed nonzero task's `.command.err`, `.command.out`
+and exit code, the tail of `logs/nextflow.log`, and available RQ exception text
+before job cleanup. Each raw file is `0600`, limited to 64 KiB; task selection
+is bounded to 4096 exit records. Truncation is explicit, and concurrent task
+errors are not claimed to establish causal ordering. Without that variable,
+raw logs fall back to `private-diagnostics` beside the harness's `evidence`
+directory and are **not durable across runner cleanup**.
+
+Only stage/reason codes, sizes, hashes and a private record basename enter
+uploadable `evidence/execution-failure.json`; raw logs never enter JUnit or
+the artifact upload. A capture failure is reported separately and cannot
+replace the original failure. Timeout acceptance checks the terminal reason
+before timing: a nonzero workflow exit is not `PROCESS_RUNNER_TIMEOUT`.
+
 ## Container smoke
 
 The CI entry point builds the runner image locally and calls the maintained

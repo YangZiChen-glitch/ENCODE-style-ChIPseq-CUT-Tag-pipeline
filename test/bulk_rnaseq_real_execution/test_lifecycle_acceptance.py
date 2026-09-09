@@ -104,6 +104,9 @@ def test_real_nextflow_timeout_persists_failure_and_reaps_execution_tree(
 
     assert activity.nextflow_observed is True
     assert activity.process_group_count >= 1
+    # A nonzero workflow exit is not a timeout, irrespective of elapsed time.
+    assert evidence.error_code == "RUN_EXECUTION_FAILED"
+    assert evidence.error_reason_code == "PROCESS_RUNNER_TIMEOUT"
     assert elapsed_after_activity >= _WORKFLOW_TIMEOUT_SECONDS - 2
     assert evidence.lifecycle_status == "failed"
     assert evidence.lifecycle_history[-3:] == ("queued", "running", "failed")
@@ -113,8 +116,6 @@ def test_real_nextflow_timeout_persists_failure_and_reaps_execution_tree(
     assert evidence.cancellation_acknowledged is False
     assert evidence.cancellation_reason is None
     assert evidence.event_types.count("execution_cleanup_failed") == 0
-    assert evidence.error_code == "RUN_EXECUTION_FAILED"
-    assert evidence.error_reason_code == "PROCESS_RUNNER_TIMEOUT"
     _assert_no_result_attempts(evidence)
     assert evidence.rq_status == "failed"
     assert evidence.rq_failed is True

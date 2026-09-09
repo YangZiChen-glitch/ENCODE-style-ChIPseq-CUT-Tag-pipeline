@@ -677,6 +677,35 @@ def test_rq_terminal_metadata_stabilization_observes_failed_state() -> None:
     assert clock.value == pytest.approx(platform_harness._RQ_TERMINAL_POLL_SECONDS)
 
 
+def test_failed_collect_preserves_evidence_before_job_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _private_config_harness(tmp_path, monkeypatch)
+    submitted = SimpleNamespace(run_id="run-test", job_id="job-test")
+    harness._submitted.append(submitted)
+    job = SimpleNamespace(
+        is_finished=False, refresh=lambda: None, exc_info="private worker traceback"
+    )
+    harness._run_queue = SimpleNamespace(
+        _queue=SimpleNamespace(fetch_job=lambda _: job)
+    )
+    calls = []
+
+    def terminal(_):
+        calls.append("terminal-before-cleanup")
+        raise AssertionError("missing terminal metadata")
+
+    monkeypatch.setattr(harness, "collect_terminal", terminal)
+    with pytest.raises(AssertionError, match="did not finish successfully"):
+        harness.collect(submitted)
+    assert calls == ["terminal-before-cleanup"]
+    public = harness.temporary_root / "evidence/execution-failure.json"
+    assert "private worker traceback" not in public.read_text()
+    payload = json.loads(public.read_text())
+    private = harness.temporary_root / "private-diagnostics" / payload["private_record"]
+    assert (private / "rq-exception.txt").read_text() == "private worker traceback"
+
+
 def test_platform_submission_injects_the_acceptance_process_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

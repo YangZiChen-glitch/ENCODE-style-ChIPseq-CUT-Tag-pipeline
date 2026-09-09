@@ -37,6 +37,7 @@ from encode_pipeline.services.managed_containers import ManagedContainerCleaner
 from encode_pipeline.services.materialization import WorkspaceMaterializer
 from encode_pipeline.services.process_runner import ProcessResult, ProcessRunner
 
+from .failure_diagnostics import preserve_execution_failure
 from .support import (
     AcceptanceFixture,
     GateSettings,
@@ -336,6 +337,17 @@ def _execute_rapid_quant(
     assert not preflight.issues
 
     executed = runner.run(command)
+    if executed.is_failure or executed.value.exit_code != 0:
+        preserve_execution_failure(
+            workspace=workspace,
+            evidence_root=workspace.parent / "evidence",
+            stage="rapid-quant",
+            reason_code=(
+                "LOCAL_RUN_PROCESS_FAILED"
+                if executed.is_failure
+                else "LOCAL_RUN_EXECUTION_FAILED"
+            ),
+        )
     assert executed.is_success
     if expect_success:
         assert executed.value.exit_code == 0

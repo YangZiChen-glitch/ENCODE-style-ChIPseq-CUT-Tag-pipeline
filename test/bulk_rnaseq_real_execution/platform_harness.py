@@ -65,6 +65,7 @@ from encode_pipeline.workers.timeouts import WorkerHardTimeout
 
 from workers.process_helpers import terminate_rq_worker
 
+from .failure_diagnostics import preserve_execution_failure
 from .support import (
     FIXTURE_MANIFEST_ENV,
     MANAGED_DOCKER_EXECUTABLE_ENV as GATE_DOCKER_EXECUTABLE_ENV,
@@ -297,6 +298,12 @@ class PlatformAcceptanceHarness:
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        if _exc_type is not None:
+            for submitted in self._submitted:
+                if not (
+                    self.temporary_root / "evidence/execution-failure.json"
+                ).exists():
+                    self._preserve_failure(submitted)
         try:
             self.close()
         except Exception:
@@ -546,6 +553,11 @@ class PlatformAcceptanceHarness:
             raise AssertionError("accepted RQ job disappeared")
         job.refresh()
         if not job.is_finished:
+            # Collect while RQ metadata still exists, before close deletes it.
+            try:
+                self.collect_terminal(submitted)
+            except Exception:
+                self._preserve_failure(submitted)
             raise AssertionError("accepted RQ job did not finish successfully")
         fixture = load_acceptance_fixture(self.gate_settings.fixture_manifest)
         if (
@@ -689,11 +701,29 @@ class PlatformAcceptanceHarness:
                 assertion_reason_code=assertion_reason_code,
             )
             self._publish_terminal_lifecycle_evidence(evidence)
+            if record.status == RunStatus.FAILED:
+                self._preserve_failure(submitted, reason_code=error_reason_code)
             if not cleanup_confirmed and not allow_unstable_rq:
                 raise AssertionError("accepted lifecycle cleanup is incomplete")
             return evidence
         finally:
             persistence.close()
+
+    def _preserve_failure(
+        self, submitted: SubmittedAcceptanceRun, *, reason_code: str | None = None
+    ) -> None:
+        try:
+            job = self._require_queue()._queue.fetch_job(submitted.job_id)
+            rq_exception = getattr(job, "exc_info", None)
+        except Exception:
+            rq_exception = None
+        preserve_execution_failure(
+            workspace=self.workspace_root / submitted.run_id,
+            evidence_root=self.temporary_root / "evidence",
+            stage="platform",
+            reason_code=reason_code,
+            rq_exception=rq_exception if isinstance(rq_exception, str) else None,
+        )
 
     def _publish_terminal_lifecycle_evidence(
         self,
